@@ -1,0 +1,9 @@
+# Secrets locaux — jamais commités (repo public)
+signal2_config.json
+
+# Divers
+__pycache__/
+*.pyc
+*.log
+*.out
+signal2_state.json.tmp
