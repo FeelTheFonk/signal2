@@ -4,7 +4,7 @@
 Signal2 — Veille IA autonome pour le salon #llm du serveur Discord MASSRACE.
 
 Surveille en continu toutes les sorties de modèles d'IA (Anthropic, OpenAI,
-Google, Meta, Mistral, DeepSeek, Qwen/Alibaba, Z.ai/Zhipu, Moonshot/Kimi, xAI,
+Google, Meta, Mistral, DeepSeek, Qwen/Alibaba, Z.ai/Zhipu, Moonshot/Kimi,
 Black Forest Labs, NVIDIA, Microsoft...) via 4 couches redondantes :
 
   1. Canaux officiels (RSS + pages news)  — annonces éditeur
@@ -72,25 +72,22 @@ DEFAULT_CONFIG = {
         {"id": "anthropic",    "vendor": "Anthropic", "kind": "links",
          "url": "https://www.anthropic.com/news",
          "link_prefix": "/news/", "filter": "off", "fetch_dates": True},
-        {"id": "xai",          "vendor": "xAI", "kind": "links",
-         "url": "https://x.ai/news",
-         "link_prefix": "/news/", "filter": "off", "fetch_dates": True},
         {"id": "deepseek",     "vendor": "DeepSeek", "kind": "links",
          "url": "https://api-docs.deepseek.com/news/",
          "link_prefix": "/news/", "filter": "off", "date_in_url": r"/news/news(\d{2})(\d{2})(\d{2})$"}
     ],
     # Couche 2 — Hugging Face : nouveaux modèles publics par organisation.
     "hf_orgs": ["deepseek-ai", "Qwen", "zai-org", "moonshotai", "meta-llama",
-                "mistralai", "openai", "xai-org", "black-forest-labs",
+                "mistralai", "openai", "black-forest-labs",
                 "google", "nvidia", "microsoft"],
     # Couche 3 — GitHub : évènements publics (releases) par organisation.
     "github_orgs": ["deepseek-ai", "QwenLM", "zai-org", "moonshotai",
                     "meta-llama", "mistralai", "openai", "google",
-                    "black-forest-labs", "xai-org"],
+                    "black-forest-labs"],
     # Couche 4 — Hacker News : filet de sécurité pour tout ce qui échapperait
     # aux couches officielles (nouveaux acteurs, surprises type "Fable 5.1").
     "hn_queries": ["anthropic", "claude", "fable", "openai", "gpt", "gemini",
-                   "deepseek", "qwen", "llama", "grok", "kimi", "glm",
+                   "deepseek", "qwen", "llama", "kimi", "glm",
                    "mistral", "flux", "moonshot", "z.ai", "open weights"],
     "hn_min_points_poll": 40,
     "hn_min_points_digest": 80,
@@ -103,7 +100,7 @@ DEFAULT_CONFIG = {
 # Mots-clés de sortie de modèle / annonce technique (filtre "strong")
 MODEL_NAMES = [
     "gpt", "chatgpt", "claude", "fable", "mythos", "opus", "sonnet", "haiku",
-    "gemini", "gemma", "imagen", "veo", "grok", "llama", "qwen", "deepseek",
+    "gemini", "gemma", "imagen", "veo", "llama", "qwen", "deepseek",
     "glm", "kimi", "mistral", "codestral", "magistral", "voxtral", "ministral",
     "pixtral", "flux", "sora", "codex", "o1", "o3", "o4", "operator",
     "daybreak", "nemotron", "phi-", "copilot", "jamba", "command-r", "ernie",
@@ -125,7 +122,7 @@ HN_TITLE_RX = re.compile(
 # Titre contenant un nom de modèle + version (ex. "Fable 5.1", "GPT-5.6",
 # "GLM-5.3", "Kimi K3") : signal de sortie même sans verbe d'annonce.
 HN_MODEL_VERSION_RX = re.compile(
-    r"(claude|fable|mythos|gpt|glm|kimi|deepseek|qwen|llama|grok|gemini|"
+    r"(claude|fable|mythos|gpt|glm|kimi|deepseek|qwen|llama|gemini|"
     r"mistral|opus|sonnet|gemma|sora|flux|o[134])[\s-]*v?\d+(\.\d+)?", re.I)
 HN_EXCLUDE_RX = re.compile(r"^(ask hn|show hn|tell hn)\b|hiring|who is hiring", re.I)
 
@@ -140,7 +137,6 @@ VENDOR_PATTERNS = [
     ("Z.ai (Zhipu)",    r"\bglm|z\.?ai|zhipu|chatglm"),
     ("Moonshot AI",     r"kimi|moonshot"),
     ("Mistral AI",      r"mistral|codestral|magistral|voxtral|ministral|pixtral|shieldstral"),
-    ("xAI",             r"\bgrok\b|\bxai\b|grokkit"),
     ("Black Forest Labs", r"flux|black.?forest|\bbfl\b"),
     ("NVIDIA",          r"nvidia|nemotron|\blnm\b"),
     ("Microsoft",       r"microsoft|\bphi-|copilot|mai-1|majidoma"),
@@ -159,7 +155,7 @@ VENDOR_STYLE = {
     "Google DeepMind":   0x4285F4, "DeepSeek":         0x4D6BFE,
     "Qwen (Alibaba)":    0xFF6A00, "Meta AI":          0x0866FF,
     "Z.ai (Zhipu)":      0x2F6BFF, "Moonshot AI":      0x8B5CF6,
-    "Mistral AI":        0xFA500F, "xAI":              0x9AA0A6,
+    "Mistral AI":        0xFA500F,
     "Black Forest Labs": 0x5865F2, "NVIDIA":           0x76B900,
     "Microsoft":         0x00A4EF, "_default":         0x5865F2,
 }
@@ -169,7 +165,7 @@ GITHUB_AVATAR = {
     "Google DeepMind": "google-deepmind", "DeepSeek": "deepseek-ai",
     "Qwen (Alibaba)": "QwenLM", "Meta AI": "meta-llama",
     "Z.ai (Zhipu)": "zai-org", "Moonshot AI": "moonshotai",
-    "Mistral AI": "mistralai", "xAI": "xai-org",
+    "Mistral AI": "mistralai",
     "Black Forest Labs": "black-forest-labs", "NVIDIA": "nvidia",
     "Microsoft": "microsoft",
 }
@@ -300,7 +296,7 @@ def fmt_date(dt):
 
 
 TITLE_KEEP_UPPER = {"gpt", "glm", "ai", "llm", "api", "aws", "xp", "cli",
-                    "tts", "stt", "r&d", "xai", "vlm", "agi", "ecg", "ehr"}
+                    "tts", "stt", "r&d", "vlm", "agi", "ecg", "ehr"}
 
 
 def pretty_title(s):
@@ -612,7 +608,6 @@ def source_label(source_id):
         "qwen-rss": "Blog Qwen",
         "google-rss": "Blog DeepMind",
         "anthropic": "Newsroom Anthropic",
-        "xai": "Newsroom xAI",
         "deepseek": "Notes API DeepSeek",
     }.get(source_id, source_id)
 
@@ -860,14 +855,14 @@ def send_launch_message(cfg):
         "description":
             "Veille autonome dédiée aux **sorties de modèles d'intelligence "
             "artificielle**, publiée en continu sur ce salon.\n\n"
-            "Analyse automatique de **30 sources** réparties en quatre couches "
+            "Analyse automatique de **42 sources** réparties en quatre couches "
             "redondantes, sans dépendance à aucun poste local — infrastructure "
             "cloud GitHub Actions.",
         "color": 0x5865F2,
         "fields": [
             {"name": "Couverture", "value":
              "Anthropic · OpenAI · Google DeepMind · Meta · DeepSeek · "
-             "Qwen/Alibaba · Z.ai (GLM) · Moonshot/Kimi · Mistral · xAI · "
+             "Qwen/Alibaba · Z.ai (GLM) · Moonshot/Kimi · Mistral · "
              "Black Forest Labs · NVIDIA · Microsoft — et tout acteur émergent",
              "inline": False},
             {"name": "Méthode", "value":

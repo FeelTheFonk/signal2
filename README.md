@@ -12,9 +12,9 @@ structured alerts to a Discord channel.
 
 | Layer | Sources | Signal |
 |---|---|---|
-| Official | OpenAI, Mistral, Qwen, Google DeepMind newsfeeds + Anthropic, xAI, DeepSeek newsrooms | model releases & vendor announcements |
-| Open weights | Hugging Face — 12 organizations (DeepSeek, Qwen, Z.ai, Moonshot, Meta, Mistral, OpenAI, xAI, BFL, Google, NVIDIA, Microsoft) | new public checkpoints |
-| Code | GitHub release events — 10 organizations | tags & releases |
+| Official | OpenAI, Mistral, Qwen, Google DeepMind newsfeeds + Anthropic, DeepSeek newsrooms | model releases & vendor announcements |
+| Open weights | Hugging Face — 11 organizations (DeepSeek, Qwen, Z.ai, Moonshot, Meta, Mistral, OpenAI, BFL, Google, NVIDIA, Microsoft) | new public checkpoints |
+| Code | GitHub release events — 9 organizations | tags & releases |
 | Community | Hacker News (Algolia API), score-gated | strong resonance — safety net for anything the above misses |
 
 ## Nothing is ever missed, nothing is ever duplicated
