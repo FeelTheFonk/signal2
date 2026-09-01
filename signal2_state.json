@@ -1,6 +1,19 @@
 {
-  "delivered": {},
-  "meta": {},
+  "delivered": {
+    "evt_341eab2233cfcf79cdd1d6721d6edf0b": {
+      "at": "2026-09-01T23:17:26.807943+00:00",
+      "message_id": "1544486371912060989",
+      "title": "Claude Fable 5.1"
+    },
+    "evt_b1e09a62bd63bca5ba8fdc572aa7b97d": {
+      "at": "2026-09-01T23:17:27.326682+00:00",
+      "message_id": "1544486376106623069",
+      "title": "DeepSeek-V4-Flash-Vision-Exp"
+    }
+  },
+  "meta": {
+    "last_heartbeat_at": "2026-09-01T23:17:23.369707+00:00"
+  },
   "pending": {},
   "version": 3
 }
