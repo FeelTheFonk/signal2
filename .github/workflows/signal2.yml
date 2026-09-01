@@ -1,0 +1,109 @@
+name: Signal2
+
+on:
+  schedule:
+    # Five-minute cadence, deliberately offset from :00 where GitHub documents
+    # higher scheduled-workflow load. Catch-up windows make punctuality non-critical.
+    - cron: "2-57/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode"
+        required: true
+        default: "digest"
+        type: choice
+        options:
+          - digest
+          - poll
+      days:
+        description: "Digest lookback in days (1-30)"
+        required: true
+        default: "7"
+        type: string
+      publish:
+        description: "Publish to Discord"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: signal2-state
+  cancel-in-progress: false
+
+jobs:
+  signal2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SIGNAL2_WEBHOOK: ${{ secrets.SIGNAL2_WEBHOOK }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Run Signal2
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_DAYS: ${{ inputs.days }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            python3 signal2.py --poll --publish
+            exit $?
+          fi
+
+          publish_flag=()
+          if [[ "$INPUT_PUBLISH" == "true" ]]; then
+            publish_flag=(--publish)
+          fi
+
+          case "$INPUT_MODE" in
+            digest)
+              if ! [[ "$INPUT_DAYS" =~ ^([1-9]|[12][0-9]|30)$ ]]; then
+                echo "days must be an integer from 1 to 30" >&2
+                exit 2
+              fi
+              python3 signal2.py --digest "$INPUT_DAYS" "${publish_flag[@]}"
+              ;;
+            poll)
+              python3 signal2.py --poll "${publish_flag[@]}"
+              ;;
+            *)
+              echo "Unsupported mode: $INPUT_MODE" >&2
+              exit 2
+              ;;
+          esac
+
+      - name: Persist durable state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add signal2_state.json
+          if git diff --cached --quiet; then
+            echo "No state change."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "signal2(state): $(date -u +%FT%TZ)"
+
+          for attempt in 1 2 3; do
+            git fetch origin main
+            if git rebase origin/main && git push origin HEAD:main; then
+              exit 0
+            fi
+            git rebase --abort >/dev/null 2>&1 || true
+            sleep $((attempt * 2))
+          done
+
+          echo "Failed to persist Signal2 state after 3 attempts." >&2
+          exit 1

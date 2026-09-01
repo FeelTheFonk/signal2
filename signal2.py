@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Signal2 — autonomous AI model-release intelligence for GitHub Actions + Discord.
+
+Design goals:
+- stdlib only, zero external runtime dependency;
+- GitHub Actions as the only host;
+- evidence-first aggregation across independent public sources;
+- durable outbox: an event is marked delivered only after Discord confirms it;
+- catch-up polling instead of relying on scheduler punctuality;
+- fail-open for detection (one broken source never aborts the whole cycle).
+
+The system cannot mathematically guarantee exactly-once delivery with a remote HTTP
+webhook and Git-backed state. It deliberately chooses at-least-once semantics:
+a rare duplicate after an ambiguous crash is preferable to silently losing an alert.
 """
-Signal2 — Veille IA autonome pour le salon #llm du serveur Discord MASSRACE.
 
-Surveille en continu toutes les sorties de modèles d'IA (Anthropic, OpenAI,
-Google, Meta, Mistral, DeepSeek, Qwen/Alibaba, Z.ai/Zhipu, Moonshot/Kimi,
-Black Forest Labs, NVIDIA, Microsoft...) via 4 couches redondantes :
-
-  1. Canaux officiels (RSS + pages news)  — annonces éditeur
-  2. Hugging Face (API publique)           — nouveaux poids ouverts par org
-  3. GitHub (API évènements d'org)         — releases / tags
-  4. Hacker News (API Algolia)             — buzz fort = filet de sécurité
-
-Modes :
-  --poll          : un cycle de veille (envoie les nouveautés sur Discord)
-  --loop [MIN]    : cycles répétés avec pause de MIN minutes (déf. 15)
-  --test          : cycle à blanc, rien n'est envoyé
-  --digest [DAYS] : publie un digest rétrospectif des N derniers jours
-  --launch-msg    : publie le message de présentation du système
-
-Stdlib uniquement (aucune dépendance à installer).
-État : signal2_state.json · Journal : signal2.log
-"""
+from __future__ import annotations
 
 import argparse
 import email.utils
 import hashlib
-import html as htmllib
+import html
 import json
 import os
 import re
@@ -36,909 +29,1238 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-
-# ---------------------------------------------------------------------------
-# Chemins & constantes
-# ---------------------------------------------------------------------------
-
-BASE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE, "signal2_config.json")
-STATE_PATH = os.path.join(BASE, "signal2_state.json")
-LOG_PATH = os.path.join(BASE, "signal2.log")
-
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Signal2-Veille/1.0")
+from pathlib import Path
+from typing import Any, Callable
 
 UTC = timezone.utc
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_STATE_PATH = BASE_DIR / "signal2_state.json"
+USER_AGENT = "Signal2/2.0 (+https://github.com/FeelTheFonk/signal2)"
 
-DEFAULT_CONFIG = {
-    # Le webhook Discord est fourni via la variable d'environnement
-    # SIGNAL2_WEBHOOK (secret GitHub Actions) ou signal2_config.json (local,
-    # gitignored). Il ne doit JAMAIS être commité dans ce fichier (repo public).
-    "webhook_url": "",
-    "webhook_name": "Signal2 · Veille IA",
-    # Couche 1 — canaux officiels. "filter": strong = filtre par mots-clés,
-    # off = tout publier (chaîne news déjà spécialisée).
-    "official_sources": [
-        {"id": "openai-rss",   "vendor": "OpenAI",    "kind": "rss",
-         "url": "https://openai.com/news/rss.xml", "filter": "strong"},
-        {"id": "mistral-rss",  "vendor": "Mistral AI", "kind": "rss",
-         "url": "https://mistral.ai/news/rss", "filter": "strong"},
-        {"id": "qwen-rss",     "vendor": "Qwen (Alibaba)", "kind": "rss",
-         "url": "https://qwenlm.github.io/blog/index.xml", "filter": "off"},
-        {"id": "google-rss",   "vendor": "Google DeepMind", "kind": "rss",
-         "url": "https://blog.google/technology/google-deepmind/rss/", "filter": "strong"},
-        {"id": "anthropic",    "vendor": "Anthropic", "kind": "links",
-         "url": "https://www.anthropic.com/news",
-         "link_prefix": "/news/", "filter": "off", "fetch_dates": True},
-        {"id": "deepseek",     "vendor": "DeepSeek", "kind": "links",
-         "url": "https://api-docs.deepseek.com/news/",
-         "link_prefix": "/news/", "filter": "off", "date_in_url": r"/news/news(\d{2})(\d{2})(\d{2})$"}
-    ],
-    # Couche 2 — Hugging Face : nouveaux modèles publics par organisation.
-    "hf_orgs": ["deepseek-ai", "Qwen", "zai-org", "moonshotai", "meta-llama",
-                "mistralai", "openai", "black-forest-labs",
-                "google", "nvidia", "microsoft"],
-    # Couche 3 — GitHub : évènements publics (releases) par organisation.
-    "github_orgs": ["deepseek-ai", "QwenLM", "zai-org", "moonshotai",
-                    "meta-llama", "mistralai", "openai", "google",
-                    "black-forest-labs"],
-    # Couche 4 — Hacker News : filet de sécurité pour tout ce qui échapperait
-    # aux couches officielles (nouveaux acteurs, surprises type "Fable 5.1").
-    "hn_queries": ["anthropic", "claude", "fable", "openai", "gpt", "gemini",
-                   "deepseek", "qwen", "llama", "kimi", "glm",
-                   "mistral", "flux", "moonshot", "z.ai", "open weights"],
-    "hn_min_points_poll": 40,
-    "hn_min_points_digest": 80,
-    "hn_window_hours": 48,
-    # Publication
-    "max_items_per_cycle": 30,
-    "embeds_per_message": 10
+POLL_LOOKBACK_HOURS = 48
+STATE_RETENTION_DAYS = 120
+POLL_DELIVERY_LIMIT = 30
+HTTP_TIMEOUT = 20
+MAX_HTTP_RETRIES = 3
+
+OFFICIAL_FEEDS = (
+    {"id": "openai-news", "vendor": "OpenAI", "url": "https://openai.com/news/rss.xml", "filter": True},
+    {"id": "mistral-news", "vendor": "Mistral AI", "url": "https://mistral.ai/news/rss", "filter": True},
+    {"id": "qwen-blog", "vendor": "Qwen (Alibaba)", "url": "https://qwenlm.github.io/blog/index.xml", "filter": True},
+    {"id": "google-deepmind", "vendor": "Google", "url": "https://blog.google/technology/google-deepmind/rss/", "filter": True},
+)
+
+# Focused first-party model publishers. Broad/noisy organizations are still
+# collected, but non-core Microsoft/NVIDIA uploads are discovery evidence rather
+# than authoritative releases unless independently corroborated.
+HF_ORGS = (
+    "deepseek-ai",
+    "Qwen",
+    "zai-org",
+    "moonshotai",
+    "meta-llama",
+    "mistralai",
+    "openai",
+    "black-forest-labs",
+    "nvidia",
+    "microsoft",
+)
+
+HN_QUERIES = (
+    "Claude model release",
+    "OpenAI model release",
+    "Gemini model release",
+    "DeepSeek model release",
+    "Qwen model release",
+    "Llama model release",
+    "Mistral model release",
+    "Kimi model release",
+    "GLM model release",
+    "FLUX model release",
+    "new open weights model",
+)
+
+SLUG_TO_VENDOR = {
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "google": "Google",
+    "google-deepmind": "Google",
+    "deepmind": "Google",
+    "deepseek": "DeepSeek",
+    "deepseek-ai": "DeepSeek",
+    "qwen": "Qwen (Alibaba)",
+    "qwenlm": "Qwen (Alibaba)",
+    "alibaba": "Qwen (Alibaba)",
+    "meta": "Meta AI",
+    "meta-llama": "Meta AI",
+    "zai": "Z.ai (Zhipu)",
+    "zai-org": "Z.ai (Zhipu)",
+    "zhipu": "Z.ai (Zhipu)",
+    "moonshotai": "Moonshot AI",
+    "moonshot": "Moonshot AI",
+    "mistral": "Mistral AI",
+    "mistralai": "Mistral AI",
+    "black-forest-labs": "Black Forest Labs",
+    "bfl": "Black Forest Labs",
+    "nvidia": "NVIDIA",
+    "microsoft": "Microsoft",
+    "cohere": "Cohere",
+    "ai21": "AI21 Labs",
+    "minimax": "MiniMax",
+    "baidu": "Baidu",
+    "tencent": "Tencent",
+    "01-ai": "01.AI",
+    "reka-ai": "Reka AI",
+    "reka": "Reka AI",
+    "upstage": "Upstage",
 }
 
-# Mots-clés de sortie de modèle / annonce technique (filtre "strong")
-MODEL_NAMES = [
-    "gpt", "chatgpt", "claude", "fable", "mythos", "opus", "sonnet", "haiku",
-    "gemini", "gemma", "imagen", "veo", "llama", "qwen", "deepseek",
-    "glm", "kimi", "mistral", "codestral", "magistral", "voxtral", "ministral",
-    "pixtral", "flux", "sora", "codex", "o1", "o3", "o4", "operator",
-    "daybreak", "nemotron", "phi-", "copilot", "jamba", "command-r", "ernie",
-    "hunyuan", "abab", "aya", "solar-", "gemma"
-]
-RELEASE_ACTIONS = [
-    "introduc", "launch", "releas", "announc", "unveil", "debut",
-    "now available", "available", "preview", "upgrad", "price", "cost",
-    "context window", "faster", "speed", "benchmark", "frontier", "state-of-the-art"
-]
-STRONG_PHRASES = [
-    "open weight", "open-sourc", "open sourc", "weights", "research preview",
-    "new model", "latest model", "next model", "frontier model"
-]
-HN_TITLE_RX = re.compile(
-    r"(launch|releas|introduc|announc|unveil|debut|open.?sourc|weight|"
-    r"new model|frontier|benchmark|state.of.the.art|drops?|ships?|out now)",
-    re.I)
-# Titre contenant un nom de modèle + version (ex. "Fable 5.1", "GPT-5.6",
-# "GLM-5.3", "Kimi K3") : signal de sortie même sans verbe d'annonce.
-HN_MODEL_VERSION_RX = re.compile(
-    r"(claude|fable|mythos|gpt|glm|kimi|deepseek|qwen|llama|gemini|"
-    r"mistral|opus|sonnet|gemma|sora|flux|o[134])[\s-]*v?\d+(\.\d+)?", re.I)
-HN_EXCLUDE_RX = re.compile(r"^(ask hn|show hn|tell hn)\b|hiring|who is hiring", re.I)
-
-# Détection éditeur par nom — ordre = priorité
-VENDOR_PATTERNS = [
-    ("Anthropic",       r"\bclaude|\bfable|\bmythos|\bopus|\bsonnet|\bhaiku|anthropic"),
-    ("OpenAI",          r"openai|\bgpt|\bchatgpt|\bsora\b|\bcodex|\bo[134]\b|\boperator|davinci|whisper"),
-    ("Google DeepMind", r"gemini|gemma|imagen|\bveo\b|deepmind|googleness|notebooklm"),
-    ("DeepSeek",        r"deepseek"),
-    ("Qwen (Alibaba)",  r"qwen|alibaba|tongyi|wan2"),
-    ("Meta AI",         r"llama|\bmeta\b|code llama"),
-    ("Z.ai (Zhipu)",    r"\bglm|z\.?ai|zhipu|chatglm"),
-    ("Moonshot AI",     r"kimi|moonshot"),
-    ("Mistral AI",      r"mistral|codestral|magistral|voxtral|ministral|pixtral|shieldstral"),
-    ("Black Forest Labs", r"flux|black.?forest|\bbfl\b"),
-    ("NVIDIA",          r"nvidia|nemotron|\blnm\b"),
-    ("Microsoft",       r"microsoft|\bphi-|copilot|mai-1|majidoma"),
-    ("AI21",            r"ai21|jamba"),
-    ("Cohere",          r"cohere|command-?r|aya"),
-    ("Reka",            r"\breka\b"),
-    ("MiniMax",         r"minimax|abab"),
-    ("01.AI",           r"yi-|01\.ai"),
-    ("Tencent",         r"hunyuan|tencent"),
-    ("Baidu",           r"ernie|baidu"),
-    ("Upstage",         r"solar-|upstage"),
-]
-
-VENDOR_STYLE = {
-    "Anthropic":         0xD97757, "OpenAI":           0x10A37F,
-    "Google DeepMind":   0x4285F4, "DeepSeek":         0x4D6BFE,
-    "Qwen (Alibaba)":    0xFF6A00, "Meta AI":          0x0866FF,
-    "Z.ai (Zhipu)":      0x2F6BFF, "Moonshot AI":      0x8B5CF6,
-    "Mistral AI":        0xFA500F,
-    "Black Forest Labs": 0x5865F2, "NVIDIA":           0x76B900,
-    "Microsoft":         0x00A4EF, "_default":         0x5865F2,
-}
-# Logos éditeurs (avatars d'organisations GitHub — URLs publiques stables)
-GITHUB_AVATAR = {
-    "Anthropic": "anthropics", "OpenAI": "openai",
-    "Google DeepMind": "google-deepmind", "DeepSeek": "deepseek-ai",
-    "Qwen (Alibaba)": "QwenLM", "Meta AI": "meta-llama",
-    "Z.ai (Zhipu)": "zai-org", "Moonshot AI": "moonshotai",
-    "Mistral AI": "mistralai",
-    "Black Forest Labs": "black-forest-labs", "NVIDIA": "nvidia",
+VENDOR_TO_SLUG = {
+    "Anthropic": "anthropic",
+    "OpenAI": "openai",
+    "Google": "google",
+    "DeepSeek": "deepseek",
+    "Qwen (Alibaba)": "qwen",
+    "Meta AI": "meta",
+    "Z.ai (Zhipu)": "zai",
+    "Moonshot AI": "moonshotai",
+    "Mistral AI": "mistral",
+    "Black Forest Labs": "black-forest-labs",
+    "NVIDIA": "nvidia",
     "Microsoft": "microsoft",
+    "Cohere": "cohere",
+    "AI21 Labs": "ai21",
+    "MiniMax": "minimax",
+    "Baidu": "baidu",
+    "Tencent": "tencent",
+    "01.AI": "01-ai",
+    "Reka AI": "reka",
+    "Upstage": "upstage",
 }
 
-MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
-           "août", "septembre", "octobre", "novembre", "décembre"]
-
-# ---------------------------------------------------------------------------
-# Utilitaires
-# ---------------------------------------------------------------------------
-
-def log(msg):
-    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except OSError:
-        pass
-    print(line, flush=True)
+# Hosting/routing providers that are not model creators. Their catalog entries are
+# accepted only when the underlying creator can be resolved from a qualified model
+# id or from the model name.
+AGGREGATOR_PROVIDERS = {
+    "openrouter", "groq", "togetherai", "together", "fireworks", "deepinfra",
+    "amazon-bedrock", "bedrock", "azure", "azure-openai", "vertex", "cloudflare",
+    "cerebras", "baseten", "replicate", "fal", "perplexity",
+}
 
 
-def http_get(url, headers=None, timeout=25, retries=2):
-    """GET avec retries ; renvoie le corps (str) ou lève une Exception."""
-    hdrs = {"User-Agent": UA, "Accept": "*/*"}
-    if headers:
-        hdrs.update(headers)
-    last_err = None
-    for attempt in range(retries + 1):
+VENDOR_PATTERNS = (
+    ("Anthropic", r"\banthropic\b|\bclaude\b|\bfable\b|\bmythos\b|\bopus\b|\bsonnet\b|\bhaiku\b"),
+    ("OpenAI", r"\bopenai\b|\bchatgpt\b|\bgpt[- .]?\d|\bsora\b|\bcodex\b|\bo[134][-. ]?\d*\b"),
+    ("Google", r"\bgoogle\b|\bdeepmind\b|\bgemini\b|\bgemma\b|\bimagen\b|\bveo\b"),
+    ("DeepSeek", r"\bdeepseek\b"),
+    ("Qwen (Alibaba)", r"\bqwen\b|\balibaba\b|\btongyi\b|\bwan[- .]?\d"),
+    ("Meta AI", r"\bmeta\b|\bllama\b"),
+    ("Z.ai (Zhipu)", r"\bz\.?ai\b|\bzhipu\b|\bglm[- .]?\d"),
+    ("Moonshot AI", r"\bmoonshot\b|\bkimi\b"),
+    ("Mistral AI", r"\bmistral\b|\bcodestral\b|\bmagistral\b|\bvoxtral\b|\bministral\b|\bpixtral\b"),
+    ("Black Forest Labs", r"\bblack forest\b|\bflux(?:\.|\b)"),
+    ("NVIDIA", r"\bnvidia\b|\bnemotron\b"),
+    ("Microsoft", r"\bmicrosoft\b|\bphi[- .]?\d|\bmai[- .]?\d"),
+    ("Cohere", r"\bcohere\b|\bcommand[- ]?r\b|\baya\b"),
+    ("AI21 Labs", r"\bai21\b|\bjamba\b"),
+    ("MiniMax", r"\bminimax\b|\babab\b"),
+    ("Baidu", r"\bbaidu\b|\bernie\b"),
+    ("Tencent", r"\btencent\b|\bhunyuan\b"),
+    ("01.AI", r"\b01\.ai\b|\byi[- .]?\d"),
+    ("Reka AI", r"\breka\b"),
+    ("Upstage", r"\bupstage\b|\bsolar[- .]?\d"),
+)
+
+MODEL_HINT_RE = re.compile(
+    r"\b(gpt|claude|fable|mythos|opus|sonnet|haiku|gemini|gemma|imagen|veo|deepseek|qwen|"
+    r"llama|glm|kimi|mistral|codestral|magistral|voxtral|ministral|pixtral|"
+    r"flux|sora|codex|nemotron|phi|jamba|command[- ]?r|aya|ernie|hunyuan|"
+    r"new model|frontier model|open weights?|open[- ]source model)\b",
+    re.IGNORECASE,
+)
+RELEASE_RE = re.compile(
+    r"\b(introduc(?:e|es|ed|ing)?|launch(?:e[ds]?|ing)?|releas(?:e[ds]?|ing)?|"
+    r"announc(?:e[ds]?|ing)?|unveil(?:ed|s|ing)?|debut(?:s|ed|ing)?|ships?|"
+    r"now available|available today|generally available|ga release|public preview|"
+    r"research preview|open weights?|open[- ]source)\b",
+    re.IGNORECASE,
+)
+VERSION_RE = re.compile(r"(?:^|[- ._/])v?\d+(?:\.\d+){0,3}(?:[-._a-z0-9]+)?", re.IGNORECASE)
+
+SOURCE_LABELS = {
+    "official": "Official",
+    "deepseek": "DeepSeek changelog",
+    "huggingface": "Hugging Face",
+    "models.dev": "models.dev",
+    "openrouter": "OpenRouter",
+    "hn": "Hacker News",
+}
+
+SOURCE_COLORS = {
+    "Anthropic": 0xD97757,
+    "OpenAI": 0x10A37F,
+    "Google": 0x4285F4,
+    "DeepSeek": 0x4D6BFE,
+    "Qwen (Alibaba)": 0xFF6A00,
+    "Meta AI": 0x0866FF,
+    "Mistral AI": 0xFA500F,
+    "NVIDIA": 0x76B900,
+    "Microsoft": 0x00A4EF,
+}
+
+
+def log(message: str) -> None:
+    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[{stamp}] {message}", flush=True)
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
         try:
-            req = urllib.request.Request(url, headers=hdrs)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read().decode("utf-8", errors="replace")
-        except Exception as e:  # noqa: BLE001 — robustesse veille
-            last_err = e
-            if attempt < retries:
-                time.sleep(2 * (attempt + 1))
-    raise last_err
-
-
-def http_post_json(url, payload):
-    """POST JSON (webhook Discord) ; gère 429 Retry-After ; renvoie True/False."""
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    for attempt in range(4):
-        req = urllib.request.Request(url, data=data, method="POST",
-                                     headers={"Content-Type": "application/json",
-                                              "User-Agent": UA})
+            dt = datetime.fromtimestamp(float(value), tz=UTC)
+        except (ValueError, OSError, OverflowError):
+            return None
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return 200 <= resp.status < 300
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                try:
-                    wait = float(json.loads(e.read().decode()).get("retry_after", 2))
-                except Exception:  # noqa: BLE001
-                    wait = 2
-                time.sleep(min(wait, 15) + 0.5)
-                continue
-            body = ""
+            if re.fullmatch(r"\d{4}-\d{2}", text):
+                text += "-01"
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
             try:
-                body = e.read().decode("utf-8", errors="replace")[:300]
-            except Exception:  # noqa: BLE001
-                pass
-            log(f"ERREUR POST webhook {e.code}: {body}")
-            return False
-        except Exception as e:  # noqa: BLE001
-            log(f"ERREUR POST webhook: {e}")
-            if attempt == 3:
-                return False
-            time.sleep(3)
-    return False
+                dt = email.utils.parsedate_to_datetime(text)
+            except (TypeError, ValueError, OverflowError):
+                return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
-def load_json(path, default):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:  # noqa: BLE001
-        return default
+def parse_link_next(header: str | None) -> str | None:
+    if not header:
+        return None
+    for part in header.split(","):
+        if re.search(r'rel\s*=\s*["\']?next["\']?', part, re.IGNORECASE):
+            match = re.search(r"<([^>]+)>", part)
+            if match:
+                return match.group(1)
+    return None
 
 
-def save_json_atomic(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+def header_value(headers: Any, name: str) -> str | None:
+    if headers is None:
+        return None
+    if hasattr(headers, "get"):
+        value = headers.get(name)
+        if value is not None:
+            return str(value)
+        value = headers.get(name.lower())
+        if value is not None:
+            return str(value)
+    for key, value in dict(headers).items():
+        if str(key).lower() == name.lower():
+            return str(value)
+    return None
 
 
-def item_key(src, ident):
-    return hashlib.sha1(f"{src}|{ident}".encode("utf-8")).hexdigest()
+def clean_text(value: str) -> str:
+    value = html.unescape(re.sub(r"<[^>]+>", " ", value or ""))
+    return re.sub(r"\s+", " ", value).strip()
 
 
-def detect_vendor(text):
-    t = text.lower()
-    for vendor, pat in VENDOR_PATTERNS:
-        if re.search(pat, t):
+def looks_like_release(title: str) -> bool:
+    text = clean_text(title)
+    if not text:
+        return False
+    if MODEL_HINT_RE.search(text) and RELEASE_RE.search(text):
+        return True
+    # Model + explicit version is a strong release-shaped signal even when a title
+    # omits the usual launch verb (e.g. "GPT-6.1").
+    return bool(MODEL_HINT_RE.search(text) and VERSION_RE.search(text) and len(text.split()) <= 4)
+
+
+def detect_vendor(text: str) -> str | None:
+    lowered = clean_text(text).lower()
+    # Explicit project requirement inherited from the current repository: xAI/Grok
+    # coverage is excluded entirely.
+    if re.search(r"\bxai\b|\bx\.ai\b|\bgrok\b", lowered):
+        return None
+    for vendor, pattern in VENDOR_PATTERNS:
+        if re.search(pattern, lowered, re.IGNORECASE):
             return vendor
     return None
 
 
-def passes_filter(title, mode):
-    """Filtre anti-bruit pour les canaux officiels généralistes.
-
-    Garde : (nom de modèle + verbe d'annonce) OU phrase de sortie explicite
-    (poids ouverts, research preview, nouveau modèle...).
-    """
-    if mode == "off":
-        return True
-    t = htmllib.unescape(title).lower()
-    has_name = any(tok in t for tok in MODEL_NAMES)
-    has_action = any(tok in t for tok in RELEASE_ACTIONS)
-    if has_name and has_action:
-        return True
-    return any(p in t for p in STRONG_PHRASES)
-
-
-def too_old(date, days=7):
-    """True si l'item date de plus de `days` jours (fenêtre d'annonce)."""
-    return bool(date) and date < datetime.now(UTC) - timedelta(days=days)
-
-
-def fmt_date(dt):
-    if not dt:
-        return "—"
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    day = f"{dt.day}er" if dt.day == 1 else str(dt.day)
-    return f"{day} {MOIS_FR[dt.month - 1]} {dt.year} · {dt.strftime('%H:%M')} UTC"
-
-
-TITLE_KEEP_UPPER = {"gpt", "glm", "ai", "llm", "api", "aws", "xp", "cli",
-                    "tts", "stt", "r&d", "vlm", "agi", "ecg", "ehr"}
-
-
-def pretty_title(s):
-    """Met en forme un titre issu d'un slug (minuscules) : casse propre,
-    acronymes préservés, versions et identifiants inchangés."""
-    out = []
-    for w in s.split():
-        lw = w.lower()
-        if lw in TITLE_KEEP_UPPER:
-            out.append(w.upper())
-        elif any(c.isdigit() for c in w):
-            out.append(w)
-        else:
-            out.append(w[:1].upper() + w[1:] if w else w)
-    return " ".join(out)
-
-
-def parse_http_date(s):
-    try:
-        return email.utils.parsedate_to_datetime(s).astimezone(UTC)
-    except Exception:  # noqa: BLE001
+def vendor_from_slug(slug: str | None) -> str | None:
+    if not slug:
         return None
-
-
-def parse_iso(s):
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(UTC)
-    except Exception:  # noqa: BLE001
+    key = slug.strip().lower().replace("_", "-")
+    if key in {"xai", "x-ai"}:
         return None
-
-# ---------------------------------------------------------------------------
-# Couche 1 — canaux officiels (RSS + pages news HTML)
-# ---------------------------------------------------------------------------
-
-def fetch_rss(source):
-    """RSS 2.0 / Atom -> liste d'items {id,title,url,date}."""
-    xml = http_get(source["url"])
-    items = []
-    root = ET.fromstring(re.sub(r"&(?!(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)",
-                                "&amp;", xml))
-    for it in root.iter("item"):
-        title = (it.findtext("title") or "").strip()
-        link = (it.findtext("link") or "").strip()
-        date = parse_http_date(it.findtext("pubDate") or "")
-        if title and link:
-            items.append({"id": link, "title": title, "url": link, "date": date})
-    if not items:  # Atom
-        ns = "{http://www.w3.org/2005/Atom}"
-        for it in root.iter(f"{ns}entry"):
-            title = (it.findtext(f"{ns}title") or "").strip()
-            link = ""
-            for l in it.findall(f"{ns}link"):
-                if l.get("href"):
-                    link = l.get("href")
-                    if l.get("rel") in (None, "alternate"):
-                        break
-            date = parse_iso(it.findtext(f"{ns}updated") or "")
-            if title and link:
-                items.append({"id": link, "title": title, "url": link, "date": date})
-    return items
+    return SLUG_TO_VENDOR.get(key) or key.replace("-", " ").title()
 
 
-DATE_META_RX = re.compile(
-    r'"datePublished"\s*:\s*"(\d{4}-\d{2}-\d{2}[^"]*)"|'
-    r'property="article:published_time"\s+content="(\d{4}-\d{2}-\d{2}[^"]*)"|'
-    r'<time[^>]+datetime="(\d{4}-\d{2}-\d{2}[^"]*)"',
-    re.I)
+DISPLAY_VENDOR_ALIASES = {
+    "Zhipuai": "Z.ai (Zhipu)",
+    "Inclusionai": "InclusionAI",
+}
 
 
-def fetch_article_date(url):
-    """Date de publication d'une page d'annonce (best effort)."""
-    try:
-        html = http_get(url, timeout=15, retries=1)
-        m = DATE_META_RX.search(html)
-        if m:
-            for g in m.groups():
-                if g:
-                    return parse_iso(g)
-    except Exception:  # noqa: BLE001
-        pass
+def display_vendor(vendor: str | None) -> str:
+    value = vendor or "Unknown"
+    return DISPLAY_VENDOR_ALIASES.get(value, value)
+
+
+def extract_model_id(title: str, vendor: str | None = None) -> str | None:
+    text = clean_text(title)
+    suffix = r"(?:[- .](?:pro|flash|mini|nano|lite|preview|exp|experimental|max|fast|vision|reasoner|coder|instruct|chat|thinking)){0,4}"
+    patterns = (
+        rf"\bGPT[- .]?\d+(?:\.\d+)*{suffix}",
+        rf"\bClaude\s+(?:Opus|Sonnet|Haiku)?\s*\d+(?:\.\d+)*{suffix}",
+        rf"\bGemini\s+\d+(?:\.\d+)*{suffix}",
+        rf"\bGemma\s+\d+(?:\.\d+)*{suffix}",
+        r"\bDeepSeek[- .][A-Za-z0-9._-]+",
+        r"\bQwen[A-Za-z0-9._-]*\d[A-Za-z0-9._-]*",
+        rf"\bLlama\s+\d+(?:\.\d+)*{suffix}",
+        rf"\bGLM[- .]?\d+(?:\.\d+)*{suffix}",
+        r"\bKimi[- .]?[A-Za-z0-9._-]*\d[A-Za-z0-9._-]*",
+        r"\b(?:Mistral|Codestral|Magistral|Voxtral|Ministral|Pixtral)[- .]?[A-Za-z0-9._-]*\d[A-Za-z0-9._-]*",
+        r"\bFLUX(?:\.|[- ])?[A-Za-z0-9._-]*\d[A-Za-z0-9._-]*",
+        rf"\b(?:Veo|Imagen|Sora|Nemotron|Phi)[- .]?\d+(?:\.\d+)*{suffix}",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(0).strip(" .,:;–—")
     return None
 
 
-def fetch_links_page(source):
-    """Page news HTML -> items {id,title,url,date?} (dates résolues à la volée)."""
-    html = http_get(source["url"])
-    base = urllib.parse.urlsplit(source["url"])
-    origin = f"{base.scheme}://{base.netloc}"
-    prefix = source.get("link_prefix", "/news/")
-    rx = re.compile(r'href="(' + re.escape(prefix) + r'[a-zA-Z0-9_\-/.]+)"')
-    seen, items = set(), []
-    for m in rx.finditer(html):
-        path = m.group(1).split("?")[0].rstrip("/")
-        if not path or path == prefix.rstrip("/"):
-            continue
-        url = origin + path if path.startswith("/") else path
-        if url in seen:
-            continue
-        seen.add(url)
-        slug = path.rsplit("/", 1)[-1]
-        title = htmllib.unescape(slug.replace("-", " ")).strip()
-        date = None
-        if source.get("date_in_url"):
-            dm = re.search(source["date_in_url"], path)
-            if dm:
-                y, mo, d = dm.groups()
-                try:
-                    date = datetime(2000 + int(y), int(mo), int(d), tzinfo=UTC)
-                except ValueError:
-                    pass
-        items.append({"id": url, "title": title, "url": url, "date": date,
-                      "slug": slug})
-    return items
+def normalize_model_token(value: str) -> str:
+    token = html.unescape(value).strip().lower()
+    token = token.split(":", 1)[0]  # OpenRouter variants (:free, :thinking, ...)
+    token = token.replace("_", "-").replace("/", "-")
+    token = re.sub(r"\b(anthropic|openai|google|deepmind|deepseek-ai|deepseek|qwenlm|qwen|"
+                   r"meta-llama|meta|mistralai|mistral|zai-org|moonshotai|black-forest-labs|"
+                   r"nvidia|microsoft)\b[- ]*", "", token)
+    token = re.sub(r"\b(introducing|introduce|released?|launch(?:ed)?|announced?|now|available|model)\b", " ", token)
+    token = re.sub(r"\b(free|beta)\b$", "", token)
+    token = re.sub(r"[-_. ]+", "-", token).strip("-")
+    return token
 
-# ---------------------------------------------------------------------------
-# Couche 2 — Hugging Face
-# ---------------------------------------------------------------------------
 
-def fetch_hf_org(org):
-    url = (f"https://huggingface.co/api/models?author={urllib.parse.quote(org)}"
-           f"&sort=createdAt&direction=-1&limit=10")
-    data = json.loads(http_get(url))
-    items = []
-    for m in data:
-        created = parse_iso(m.get("createdAt") or "")
-        tags = m.get("tags") or []
-        lic = next((t[8:] for t in tags if t.startswith("license:")), "")
-        items.append({
-            "id": m["id"], "title": m["id"], "url": f"https://huggingface.co/{m['id']}",
-            "date": created, "downloads": m.get("downloads", 0),
-            "likes": m.get("likes", 0),
-            "pipeline": m.get("pipeline_tag") or "model",
-            "license": lic,
-        })
-    return items
-
-# ---------------------------------------------------------------------------
-# Couche 3 — GitHub (évènements release)
-# ---------------------------------------------------------------------------
-
-def fetch_github_org(org, etag):
-    """ReleaseEvent publics d'une org. Renvoie (items, nouvel_etag|None)."""
-    url = f"https://api.github.com/orgs/{org}/events?per_page=100"
-    headers = {"Accept": "application/vnd.github+json",
-               "X-GitHub-Api-Version": "2022-11-28"}
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    if etag:
-        headers["If-None-Match"] = etag
-    req = urllib.request.Request(url, headers={"User-Agent": UA, **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            new_etag = resp.headers.get("ETag")
-            events = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        if e.code == 304:
-            return [], "__unchanged__"
-        raise
-    items = []
-    for ev in events:
-        if ev.get("type") != "ReleaseEvent":
-            continue
-        rel = ev.get("payload", {}).get("release") or {}
-        html_url = rel.get("html_url") or f"https://github.com/{ev['repo']['name']}/releases"
-        name = rel.get("name") or rel.get("tag_name") or ev["repo"]["name"]
-        date = parse_iso(rel.get("published_at") or ev.get("created_at") or "")
-        items.append({"id": f"gh-{ev['id']}",
-                      "title": f"{ev['repo']['name']} — {name}".strip(" —"),
-                      "url": html_url, "date": date,
-                      "repo": ev["repo"]["name"]})
-    return items, new_etag
-
-# ---------------------------------------------------------------------------
-# Couche 4 — Hacker News (Algolia)
-# ---------------------------------------------------------------------------
-
-def fetch_hn(cfg, hours_window, min_points):
-    cutoff = int((datetime.now(UTC) - timedelta(hours=hours_window)).timestamp())
-    merged = {}
-    for q in cfg["hn_queries"]:
-        url = ("https://hn.algolia.com/api/v1/search_by_date?"
-               + urllib.parse.urlencode({
-                   "query": q, "tags": "story", "hitsPerPage": 8,
-                   "numericFilters": f"created_at_i>{cutoff},points>{min_points}"}))
-        try:
-            data = json.loads(http_get(url))
-        except Exception as e:  # noqa: BLE001
-            log(f"HN query '{q}' échec: {e}")
-            continue
-        for h in data.get("hits", []):
-            t = h.get("title") or ""
-            if HN_EXCLUDE_RX.search(t):
-                continue
-            if not (HN_TITLE_RX.search(t) or HN_MODEL_VERSION_RX.search(t)):
-                continue
-            if h["objectID"] not in merged:
-                merged[h["objectID"]] = {
-                    "id": f"hn-{h['objectID']}", "title": t,
-                    "url": h.get("url") or f"https://news.ycombinator.com/item?id={h['objectID']}",
-                    "hn_url": f"https://news.ycombinator.com/item?id={h['objectID']}",
-                    "date": parse_iso(h.get("created_at") or ""),
-                    "points": h.get("points", 0),
-                    "comments": h.get("num_comments", 0),
-                    "matched_query": q,
-                }
-    # Dédoublonnage des soumissions multiples d'une même actualité :
-    # on regroupe par titre normalisé et on ne garde que la plus forte.
-    best = {}
-    for it in merged.values():
-        cluster = re.sub(r"[^a-z0-9]", "", it["title"].lower())[:40]
-        cur = best.get(cluster)
-        if not cur or it["points"] > cur["points"]:
-            best[cluster] = it
-    return list(best.values())
-
-# ---------------------------------------------------------------------------
-# Construction des items normalisés + embeds Discord
-# ---------------------------------------------------------------------------
-
-def normalize_official(source, raw):
-    vendor = detect_vendor(raw["title"]) or source["vendor"]
-    is_model = passes_filter(raw["title"], "strong")
-    title = htmllib.unescape(raw["title"])
-    if raw.get("slug"):  # titre issu d'un slug -> mise en forme propre
-        title = pretty_title(title)
+def make_candidate(
+    source: str,
+    vendor: str | None,
+    title: str,
+    url: str,
+    date: datetime | None,
+    model_id: str | None,
+    trust: int,
+    *,
+    kind: str = "release",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    vendor = vendor or detect_vendor(title)
+    inferred = model_id or extract_model_id(title, vendor)
     return {
-        "key": item_key("official", raw["id"]),
-        "source": "official",
-        "source_id": source["id"],
+        "source": source,
         "vendor": vendor,
-        "type": "release" if is_model else "news",
-        "title": title,
-        "url": raw["url"],
-        "date": raw["date"],
+        "title": clean_text(title),
+        "url": url,
+        "date": parse_datetime(date),
+        "model_id": inferred,
+        "trust": int(trust),
+        "kind": kind,
+        "metadata": metadata or {},
     }
 
 
-def build_embed(it):
-    """Embed sobre et expert : pas d'emoji, logo éditeur discret, champs
-    alignés, libellés homogènes."""
-    vendor = it.get("vendor") or detect_vendor(it["title"]) or "Indéterminé"
-    color = VENDOR_STYLE.get(vendor, VENDOR_STYLE["_default"])
-    src = it["source"]
-    avatar = GITHUB_AVATAR.get(vendor)
+def canonical_model_key(candidate: dict[str, Any]) -> str:
+    model_id = candidate.get("model_id") or extract_model_id(candidate.get("title", ""), candidate.get("vendor"))
+    if model_id:
+        return normalize_model_token(str(model_id))
+    return normalize_model_token(candidate.get("title", ""))[:120]
 
-    if src == "official":
-        category = ("SORTIE / ANNONCE" if it["type"] == "release"
-                    else "COMMUNICATION ÉDITEUR")
-        desc = ("Version ou sortie de modèle confirmée — canal officiel de "
-                "l'éditeur." if it["type"] == "release"
-                else "Communication officielle de l'éditeur.")
-        fields = [
-            {"name": "Catégorie", "value": category, "inline": True},
-            {"name": "Publié", "value": fmt_date(it.get("date")), "inline": True},
-            {"name": "Canal", "value": source_label(it.get("source_id", "")), "inline": True},
+
+def merge_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    clusters: dict[str, list[dict[str, Any]]] = {}
+    for item in candidates:
+        if not item.get("vendor") or not item.get("title") or not item.get("url"):
+            continue
+        vendor_key = re.sub(r"[^a-z0-9]+", "-", item["vendor"].lower()).strip("-")
+        model_key = canonical_model_key(item)
+        if not model_key:
+            continue
+        cluster_id = f"{vendor_key}:{model_key}"
+        clusters.setdefault(cluster_id, []).append(item)
+
+    events: list[dict[str, Any]] = []
+    for cluster_id, group in clusters.items():
+        # Exact URL/source duplicates first.
+        unique: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in group:
+            unique[(item["source"], item["url"])] = item
+        group = list(unique.values())
+        group.sort(key=lambda x: (x.get("trust", 0), x.get("date") or datetime.min.replace(tzinfo=UTC)), reverse=True)
+        primary = group[0]
+        dates = [x["date"] for x in group if x.get("date")]
+        event_date = min(dates) if dates else datetime.now(UTC)
+        sources = {x["source"] for x in group}
+        max_trust = max(x["trust"] for x in group)
+        if max_trust >= 95:
+            confidence = "official"
+        elif max_trust >= 80:
+            confidence = "confirmed"
+        elif max_trust >= 60 and len(sources) >= 2:
+            confidence = "corroborated"
+        else:
+            confidence = "discovery"
+        event_key = "evt_" + hashlib.sha256(cluster_id.encode("utf-8")).hexdigest()[:32]
+        evidence = [
+            {
+                "source": x["source"],
+                "url": x["url"],
+                "title": x["title"],
+                "trust": x["trust"],
+                "date": x["date"].isoformat() if x.get("date") else None,
+            }
+            for x in group
         ]
-
-    elif src == "hf":
-        desc = "Poids ouverts publiés sur Hugging Face."
-        fields = [
-            {"name": "Catégorie", "value": "POIDS OUVERTS", "inline": True},
-            {"name": "Publié", "value": fmt_date(it.get("date")), "inline": True},
-            {"name": "Type", "value": (it.get("pipeline") or "model").replace("-", " "), "inline": True},
-            {"name": "Téléchargements (30 j)",
-             "value": f"{it.get('downloads', 0):,}".replace(",", " "), "inline": True},
-        ]
-        if it.get("license"):
-            fields.append({"name": "Licence", "value": it["license"], "inline": True})
-
-    elif src == "github":
-        desc = "Release publiée sur GitHub."
-        fields = [
-            {"name": "Catégorie", "value": "RELEASE", "inline": True},
-            {"name": "Publié", "value": fmt_date(it.get("date")), "inline": True},
-            {"name": "Dépôt", "value": f"`{it.get('repo', '')}`", "inline": True},
-        ]
-
-    else:  # hn
-        desc = "Forte résonance communautaire — Hacker News."
-        fields = [
-            {"name": "Catégorie", "value": "VEILLE COMMUNAUTÉ", "inline": True},
-            {"name": "Score", "value": f"{it.get('points', 0)} points · "
-                                       f"{it.get('comments', 0)} commentaires",
-             "inline": True},
-            {"name": "Publié", "value": fmt_date(it.get("date")), "inline": True},
-        ]
-
-    embed = {
-        "title": it["title"][:250],
-        "url": it["url"] if src != "hn" else it["hn_url"],
-        "description": desc,
-        "color": color,
-        "fields": fields,
-        "footer": {"text": f"Signal2 — Veille IA · MASSRACE · {vendor}"},
-        "timestamp": (it.get("date") or datetime.now(UTC)).isoformat(),
-    }
-    embed["author"] = {"name": vendor}
-    if avatar:
-        embed["author"]["icon_url"] = (f"https://avatars.githubusercontent.com/"
-                                       f"{avatar}?size=64")
-    return embed
+        events.append(
+            {
+                "key": event_key,
+                "cluster_id": cluster_id,
+                "vendor": primary["vendor"],
+                "model_id": primary.get("model_id") or canonical_model_key(primary),
+                "title": primary["title"],
+                "url": primary["url"],
+                "date": event_date.isoformat(),
+                "kind": primary.get("kind", "release"),
+                "confidence": confidence,
+                "max_trust": max_trust,
+                "evidence": evidence,
+            }
+        )
+    events.sort(key=lambda e: parse_datetime(e["date"]) or datetime.min.replace(tzinfo=UTC), reverse=True)
+    return events
 
 
-def source_label(source_id):
-    return {
-        "openai-rss": "Newsroom OpenAI",
-        "mistral-rss": "Newsroom Mistral",
-        "qwen-rss": "Blog Qwen",
-        "google-rss": "Blog DeepMind",
-        "anthropic": "Newsroom Anthropic",
-        "deepseek": "Notes API DeepSeek",
-    }.get(source_id, source_id)
+def should_publish(event: dict[str, Any]) -> bool:
+    if event.get("max_trust", 0) >= 80:
+        return True
+    sources = {x.get("source") for x in event.get("evidence", [])}
+    return event.get("max_trust", 0) >= 60 and len(sources) >= 2
 
 
-def send_items(cfg, items, header=None):
-    """Envoie les items (embeds) par lots ; renvoie le nb réellement envoyés."""
-    items = sorted(items, key=lambda x: x.get("date") or datetime.now(UTC), reverse=True)
-    embeds = [build_embed(i) for i in items]
-    sent = 0
-    batches = [embeds[i:i + cfg["embeds_per_message"]]
-               for i in range(0, len(embeds), cfg["embeds_per_message"])]
-    for bi, batch in enumerate(batches):
-        payload = {"username": cfg["webhook_name"], "embeds": batch}
-        if bi == 0 and header:
-            payload["content"] = header
-        if http_post_json(cfg["webhook_url"], payload):
-            sent += len(batch)
-        time.sleep(1.5)
-    return sent
-
-# ---------------------------------------------------------------------------
-# Cycle de veille
-# ---------------------------------------------------------------------------
-
-def load_state():
-    st = load_json(STATE_PATH, None)
-    if not isinstance(st, dict):
-        st = {"seen": {}, "github_etags": {}}
-    st.setdefault("seen", {})
-    st.setdefault("github_etags", {})
-    return st
+def filter_window(candidates: list[dict[str, Any]], cutoff: datetime, *, now: datetime | None = None) -> list[dict[str, Any]]:
+    now = now or datetime.now(UTC)
+    kept = []
+    for item in candidates:
+        dt = item.get("date")
+        if dt is None:
+            if item.get("trust", 0) >= 90:
+                kept.append(item)
+            continue
+        dt = parse_datetime(dt)
+        if dt and cutoff <= dt <= now + timedelta(days=1):
+            item["date"] = dt
+            kept.append(item)
+    return kept
 
 
-def prune_seen(state, days=90):
-    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
-    state["seen"] = {k: v for k, v in state["seen"].items() if v >= cutoff}
+def parse_feed(data: bytes) -> list[dict[str, Any]]:
+    # Repair only the most common invalid bare ampersands while preserving entities.
+    text = data.decode("utf-8", errors="replace")
+    text = re.sub(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)", "&amp;", text)
+    root = ET.fromstring(text)
+    out: list[dict[str, Any]] = []
+
+    def local(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1].lower()
+
+    for node in root.iter():
+        if local(node.tag) not in {"item", "entry"}:
+            continue
+        title = ""
+        url = ""
+        date_value = None
+        for child in list(node):
+            name = local(child.tag)
+            if name == "title" and not title:
+                title = "".join(child.itertext()).strip()
+            elif name == "link" and not url:
+                url = (child.get("href") or (child.text or "")).strip()
+            elif name in {"pubdate", "published", "updated", "date"} and date_value is None:
+                date_value = (child.text or "").strip()
+        if title and url:
+            out.append({"title": clean_text(title), "url": url, "date": parse_datetime(date_value)})
+    return out
 
 
-def run_cycle(cfg, dry_run=False):
-    state = load_state()
-    seen = state["seen"]
-    fresh, errors = [], 0
-    now_iso = datetime.now(UTC).isoformat()
-    date_budget = 40  # nb max de fetchs de date d'article par cycle
-
-    # -- Couche 1 : officiels
-    for source in cfg["official_sources"]:
-        try:
-            if source["kind"] == "rss":
-                raws = fetch_rss(source)
-            else:
-                raws = fetch_links_page(source)
-            for raw in raws:
-                if not passes_filter(raw["title"], source.get("filter", "strong")):
-                    continue
-                it = normalize_official(source, raw)
-                if it["key"] in seen:
-                    continue
-                # date à la volée pour les pages HTML sans date
-                if not it.get("date") and source.get("fetch_dates") and date_budget > 0:
-                    date_budget -= 1
-                    it["date"] = fetch_article_date(it["url"]) or datetime.now(UTC)
-                # hors fenêtre d'annonce : capitalisé, jamais reposté
-                if too_old(it.get("date")):
-                    seen[it["key"]] = now_iso
-                    continue
-                fresh.append(it)
-        except Exception as e:  # noqa: BLE001
-            errors += 1
-            log(f"source {source['id']} échec: {e}")
-
-    # -- Couche 2 : Hugging Face
-    for org in cfg["hf_orgs"]:
-        try:
-            for raw in fetch_hf_org(org):
-                key = item_key("hf", raw["id"])
-                if key in seen:
-                    continue
-                if too_old(raw.get("date")):
-                    seen[key] = now_iso
-                    continue
-                fresh.append({"key": key, "source": "hf", "vendor": org,
-                              "type": "weights", "title": raw["title"],
-                              "url": raw["url"], "date": raw["date"],
-                              "downloads": raw["downloads"],
-                              "pipeline": raw["pipeline"],
-                              "license": raw["license"]})
-        except Exception as e:  # noqa: BLE001
-            errors += 1
-            log(f"HF {org} échec: {e}")
-
-    # -- Couche 3 : GitHub
-    for org in cfg["github_orgs"]:
-        try:
-            items, etag = fetch_github_org(org, state["github_etags"].get(org))
-            if etag != "__unchanged__":
-                state["github_etags"][org] = etag
-                for raw in items:
-                    key = item_key("gh", raw["id"])
-                    if key in seen:
-                        continue
-                    if too_old(raw.get("date")):
-                        seen[key] = now_iso
-                        continue
-                    fresh.append({"key": key, "source": "github",
-                                  "vendor": detect_vendor(raw["title"]) or org,
-                                  "type": "release", "title": raw["title"],
-                                  "url": raw["url"], "date": raw["date"],
-                                  "repo": raw["repo"]})
-        except Exception as e:  # noqa: BLE001
-            errors += 1
-            log(f"GitHub {org} échec: {e}")
-
-    # -- Couche 4 : Hacker News
-    try:
-        for raw in fetch_hn(cfg, cfg["hn_window_hours"], cfg["hn_min_points_poll"]):
-            key = item_key(raw["id"], raw["id"])
-            if key in seen:
+def parse_modelsdev(payload: Any) -> list[dict[str, Any]]:
+    records: list[tuple[str | None, str, dict[str, Any]]] = []
+    if isinstance(payload, list):
+        for row in payload:
+            if isinstance(row, dict) and row.get("id"):
+                records.append((None, str(row["id"]), row))
+    elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        for row in payload["data"]:
+            if isinstance(row, dict) and row.get("id"):
+                records.append((None, str(row["id"]), row))
+    elif isinstance(payload, dict) and any("/" in str(key) and isinstance(value, dict) for key, value in payload.items()):
+        for model_id, row in payload.items():
+            if "/" in str(model_id) and isinstance(row, dict):
+                records.append((None, str(model_id), row))
+    elif isinstance(payload, dict) and isinstance(payload.get("models"), dict):
+        # Provider-agnostic/lab-shaped format used by newer models.dev exports.
+        for lab, models in payload["models"].items():
+            if not isinstance(models, dict):
                 continue
-            raw["key"] = key
-            raw["vendor"] = detect_vendor(raw["title"])
-            if not raw["vendor"]:
-                continue  # hors périmètre éditeurs IA
-            fresh.append(raw)
-    except Exception as e:  # noqa: BLE001
-        errors += 1
-        log(f"HN échec: {e}")
+            for model_id, row in models.items():
+                if isinstance(row, dict):
+                    records.append((str(lab), str(model_id), row))
+    elif isinstance(payload, dict):
+        # Main API shape: {provider_id: {models: {model_id: {...}}}}.
+        for provider, provider_data in payload.items():
+            if not isinstance(provider_data, dict) or not isinstance(provider_data.get("models"), dict):
+                continue
+            for model_id, row in provider_data["models"].items():
+                if isinstance(row, dict):
+                    records.append((str(provider), str(model_id), row))
 
-    # Anti-déluge : au premier lancement ou après une longue coupure, on
-    # capitalise sans inonder le salon.
-    overflow = 0
-    if not dry_run and len(fresh) > cfg["max_items_per_cycle"]:
-        fresh.sort(key=lambda x: x.get("date") or datetime.now(UTC), reverse=True)
-        dropped = fresh[cfg["max_items_per_cycle"]:]
-        overflow = len(dropped)
-        fresh = fresh[:cfg["max_items_per_cycle"]]
+    out = []
+    seen = set()
+    for provider, raw_model_id, row in records:
+        raw_model_id = raw_model_id.strip("/")
+        name = clean_text(str(row.get("name") or raw_model_id.split("/")[-1]))
 
-    if dry_run:
-        log(f"[TEST] {len(fresh)} item(s) nouveaux détectés · {errors} source(s) en erreur")
-        for it in fresh[:40]:
-            print(f"  - [{it['source']}] {it.get('vendor','?')} | {it['title'][:80]}")
-        return fresh
-
-    sent = 0
-    if fresh:
-        releases = [i for i in fresh if i.get("type") == "release"]
-        others = [i for i in fresh if i.get("type") != "release"]
-        if releases:
-            send_items(cfg, releases,
-                       header="**VEILLE IA — SORTIES & ANNONCES DÉTECTÉES**")
-            sent += len(releases)
-        if others:
-            send_items(cfg, others)
-            sent += len(others)
-
-    now_iso = datetime.now(UTC).isoformat()
-    for it in fresh:
-        seen[it["key"]] = now_iso
-    if overflow:
-        for it in dropped:
-            seen[it["key"]] = now_iso
-    prune_seen(state)
-    save_json_atomic(STATE_PATH, state)
-    log(f"Cycle terminé : {sent} envoyé(s), {overflow} capitalisé(s), {errors} erreur(s) source")
-    return fresh
-
-# ---------------------------------------------------------------------------
-# Digest rétrospectif + message de lancement
-# ---------------------------------------------------------------------------
-
-def run_digest(cfg, days=7):
-    state = load_state()
-    seen = state["seen"]
-    cutoff = datetime.now(UTC) - timedelta(days=days)
-    collected = []
-
-    for source in cfg["official_sources"]:
-        try:
-            raws = fetch_rss(source) if source["kind"] == "rss" else fetch_links_page(source)
-            for raw in raws:
-                if not passes_filter(raw["title"], source.get("filter", "strong")):
+        if "/" in raw_model_id:
+            # Aggregator catalogs commonly retain the creator namespace here.
+            model_id = raw_model_id
+            creator_slug = raw_model_id.split("/", 1)[0]
+            vendor = vendor_from_slug(creator_slug)
+        else:
+            provider_slug = (provider or "").strip().lower().replace("_", "-")
+            if provider_slug in AGGREGATOR_PROVIDERS:
+                vendor = detect_vendor(name)
+                creator_slug = VENDOR_TO_SLUG.get(vendor or "")
+                if not vendor or not creator_slug:
                     continue
-                d = raw.get("date")
-                if not d and source.get("fetch_dates"):
-                    d = fetch_article_date(raw["url"])
-                if d and d >= cutoff:
-                    raw["date"] = d
-                    collected.append(normalize_official(source, raw))
-        except Exception as e:  # noqa: BLE001
-            log(f"digest source {source['id']} échec: {e}")
+                model_id = f"{creator_slug}/{raw_model_id}"
+            else:
+                creator_slug = provider_slug or raw_model_id.split("/", 1)[0]
+                vendor = vendor_from_slug(creator_slug)
+                if not creator_slug:
+                    continue
+                model_id = f"{creator_slug}/{raw_model_id}" if provider else raw_model_id
 
-    for org in cfg["hf_orgs"]:
+        if vendor is None or model_id in seen:
+            continue
+        seen.add(model_id)
+        release_date = parse_datetime(row.get("release_date") or row.get("created") or row.get("created_at"))
+        out.append(
+            {
+                "model_id": model_id,
+                "vendor": vendor,
+                "title": name,
+                "date": release_date,
+                "url": f"https://models.dev/models/{urllib.parse.quote(model_id, safe='/')}",
+                "open_weights": bool(row.get("open_weights", False)),
+            }
+        )
+    return out
+
+
+def parse_openrouter(payload: Any) -> list[dict[str, Any]]:
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        model_id = str(row.get("canonical_slug") or row.get("id") or "").strip()
+        if not model_id or "/" not in model_id:
+            continue
+        vendor = vendor_from_slug(model_id.split("/", 1)[0])
+        if vendor is None:
+            continue
+        name = clean_text(str(row.get("name") or model_id.split("/", 1)[1]))
+        out.append(
+            {
+                "model_id": model_id,
+                "vendor": vendor,
+                "title": name,
+                "date": parse_datetime(row.get("created")),
+                "url": "https://openrouter.ai/" + urllib.parse.quote(model_id, safe="/.-"),
+            }
+        )
+    return out
+
+
+def parse_sitemap(data: bytes) -> list[dict[str, Any]]:
+    root = ET.fromstring(data.decode("utf-8", errors="replace"))
+
+    def local(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1].lower()
+
+    rows: list[dict[str, Any]] = []
+    for node in root.iter():
+        if local(node.tag) != "url":
+            continue
+        loc = None
+        lastmod = None
+        for child in list(node):
+            name = local(child.tag)
+            if name == "loc":
+                loc = clean_text(child.text or "")
+            elif name == "lastmod":
+                lastmod = parse_datetime(child.text or "")
+        if loc:
+            rows.append({"url": loc, "lastmod": lastmod})
+    return rows
+
+
+def title_from_url_slug(url: str) -> str:
+    slug = urllib.parse.unquote(urllib.parse.urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1])
+    return re.sub(r"[-_]+", " ", slug).strip().title()
+
+
+def parse_deepseek_news(data: bytes) -> list[dict[str, Any]]:
+    text = data.decode("utf-8", errors="replace")
+    rx = re.compile(
+        r'<a\b[^>]*href=["\'](?P<href>/news/news(?P<y>\d{2})(?P<m>\d{2})(?P<d>\d{2})/?)["\'][^>]*>(?P<title>.*?)</a>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    out = []
+    seen = set()
+    for match in rx.finditer(text):
+        href = match.group("href").rstrip("/") + "/"
+        if href in seen:
+            continue
+        seen.add(href)
         try:
-            for raw in fetch_hf_org(org):
-                if raw.get("date") and raw["date"] >= cutoff:
-                    collected.append({
-                        "key": item_key("hf", raw["id"]), "source": "hf",
-                        "vendor": org, "type": "weights", "title": raw["title"],
-                        "url": raw["url"], "date": raw["date"],
-                        "downloads": raw["downloads"], "pipeline": raw["pipeline"],
-                        "license": raw["license"]})
-        except Exception as e:  # noqa: BLE001
-            log(f"digest HF {org} échec: {e}")
+            dt = datetime(2000 + int(match.group("y")), int(match.group("m")), int(match.group("d")), tzinfo=UTC)
+        except ValueError:
+            continue
+        title = clean_text(match.group("title")) or f"DeepSeek release {dt.date().isoformat()}"
+        out.append(
+            {
+                "model_id": extract_model_id(title, "DeepSeek"),
+                "vendor": "DeepSeek",
+                "title": title,
+                "date": dt,
+                "url": "https://api-docs.deepseek.com" + href,
+            }
+        )
+    return out
 
-    try:
-        for raw in fetch_hn(cfg, days * 24, cfg["hn_min_points_digest"]):
-            if raw.get("date") and raw["date"] >= cutoff and raw.get("vendor"):
-                raw["key"] = item_key(raw["id"], raw["id"])
-                collected.append(raw)
-    except Exception as e:  # noqa: BLE001
-        log(f"digest HN échec: {e}")
 
-    # Dédoublonnage par clé, tri : sorties/models d'abord puis par date
-    uniq = {}
-    for it in collected:
-        if it["key"] not in uniq:
-            uniq[it["key"]] = it
-    items = sorted(uniq.values(),
-                   key=lambda x: ((0 if x.get("type") == "release" else
-                                   1 if x["source"] == "hf" else 2),
-                                  -(x.get("date") or datetime.now(UTC)).timestamp()))
+def _request(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+    timeout: int = HTTP_TIMEOUT,
+    retries: int = MAX_HTTP_RETRIES,
+) -> tuple[bytes, Any, int]:
+    merged_headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    if headers:
+        merged_headers.update(headers)
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        request = urllib.request.Request(url, data=data, method=method, headers=merged_headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read(), response.headers, int(response.status)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code == 429 and attempt < retries:
+                retry_after = exc.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else 2.0 * (attempt + 1)
+                except ValueError:
+                    wait = 2.0 * (attempt + 1)
+                time.sleep(min(wait, 30.0))
+                continue
+            if 500 <= exc.code < 600 and attempt < retries:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt >= retries:
+                raise
+            time.sleep(min(2 ** attempt, 8))
+    assert last_error is not None
+    raise last_error
 
-    log(f"[DIGEST {days}j] {len(items)} item(s) collecté(s)")
-    # Tous les items collectés sont marqués vus (rien n'est reperdu), mais on
-    # limite le volume publié d'un coup pour garder le salon lisible.
-    published = items
-    truncated = 0
-    if len(items) > 60:
-        published = items[:60]
-        truncated = len(items) - 60
-    header = (f"**VEILLE IA — DIGEST {days} DERNIERS JOURS** · "
-              f"{len(published)} éléments"
-              + (f" ({truncated} mineurs capitalisés)" if truncated else ""))
-    sent = send_items(cfg, published, header=header)
-    now_iso = datetime.now(UTC).isoformat()
-    for it in items:
-        seen[it["key"]] = now_iso
-    save_json_atomic(STATE_PATH, state)
+
+def http_get_bytes(url: str, **kwargs: Any) -> tuple[bytes, Any]:
+    body, headers, _ = _request(url, **kwargs)
+    return body, headers
+
+
+def http_get_json(url: str, **kwargs: Any) -> tuple[Any, Any]:
+    body, headers = http_get_bytes(url, headers={"Accept": "application/json", **kwargs.pop("headers", {})}, **kwargs)
+    return json.loads(body.decode("utf-8", errors="strict")), headers
+
+
+def collect_anthropic(
+    cutoff: datetime,
+    *,
+    http_get_bytes: Callable[..., tuple[bytes, Any]] = http_get_bytes,
+) -> list[dict[str, Any]]:
+    body, _ = http_get_bytes("https://www.anthropic.com/sitemap.xml")
+    out = []
+    for row in parse_sitemap(body):
+        url = row["url"]
+        dt = row.get("lastmod")
+        if "/news/" not in urllib.parse.urlsplit(url).path or not dt or dt < cutoff:
+            continue
+        title = title_from_url_slug(url)
+        if not looks_like_release(title):
+            continue
+        out.append(
+            make_candidate(
+                "official", "Anthropic", title, url, dt, None, 100,
+                metadata={"feed": "anthropic-sitemap"},
+            )
+        )
+    return out
+
+
+def collect_official_feed(source: dict[str, Any], cutoff: datetime) -> list[dict[str, Any]]:
+    body, _ = http_get_bytes(source["url"])
+    items = []
+    for row in parse_feed(body):
+        if source.get("filter") and not looks_like_release(row["title"]):
+            continue
+        item = make_candidate(
+            "official",
+            source["vendor"],
+            row["title"],
+            row["url"],
+            row["date"],
+            None,
+            100,
+            metadata={"feed": source["id"]},
+        )
+        if item["date"] is None or item["date"] >= cutoff:
+            items.append(item)
     return items
 
 
-def send_launch_message(cfg):
+def collect_deepseek(cutoff: datetime) -> list[dict[str, Any]]:
+    body, _ = http_get_bytes("https://api-docs.deepseek.com/news/")
+    return [
+        make_candidate("deepseek", row["vendor"], row["title"], row["url"], row["date"], row["model_id"], 100)
+        for row in parse_deepseek_news(body)
+        if row["date"] >= cutoff and looks_like_release(row["title"])
+    ]
+
+
+HF_BROAD_ORG_CORE_MODEL_PATTERNS = {
+    "microsoft": re.compile(r"^(?:phi[- .]?\d|mai[- .]?\d)", re.IGNORECASE),
+    "nvidia": re.compile(r"(?:nemotron|nvlm|cosmos)", re.IGNORECASE),
+}
+
+
+def hf_trust_for_model(org: str, model_name: str) -> int:
+    """Trust first-party HF uploads, but demote noisy broad organizations.
+
+    Microsoft and NVIDIA publish many research checkpoints, conversions and
+    derived artifacts. Their core model families remain authoritative; other
+    uploads are discovery evidence and require independent corroboration.
+    """
+    pattern = HF_BROAD_ORG_CORE_MODEL_PATTERNS.get(org.lower())
+    if pattern is None:
+        return 90
+    return 90 if pattern.search(model_name) else 55
+
+
+def collect_hf_org(
+    org: str,
+    cutoff: datetime,
+    *,
+    http_get_json: Callable[..., tuple[Any, Any]] = http_get_json,
+) -> list[dict[str, Any]]:
+    url = "https://huggingface.co/api/models?" + urllib.parse.urlencode(
+        {"author": org, "sort": "createdAt", "direction": "-1", "limit": "100"}
+    )
+    out: list[dict[str, Any]] = []
+    visited = set()
+    for _ in range(100):  # corruption/loop guard, not a data cap in normal operation
+        if not url or url in visited:
+            break
+        visited.add(url)
+        rows, headers = http_get_json(url)
+        if not isinstance(rows, list) or not rows:
+            break
+        page_dates = []
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("id"):
+                continue
+            created = parse_datetime(row.get("createdAt"))
+            if created:
+                page_dates.append(created)
+            if not created or created < cutoff:
+                continue
+            tags = row.get("tags") or []
+            license_id = next((str(t)[8:] for t in tags if str(t).startswith("license:")), None)
+            vendor = vendor_from_slug(org)
+            if vendor is None:
+                continue
+            out.append(
+                make_candidate(
+                    "huggingface",
+                    vendor,
+                    str(row["id"]).split("/", 1)[-1],
+                    "https://huggingface.co/" + str(row["id"]),
+                    created,
+                    str(row["id"]),
+                    hf_trust_for_model(org, str(row["id"]).split("/", 1)[-1]),
+                    kind="open_weights",
+                    metadata={
+                        "pipeline": row.get("pipeline_tag"),
+                        "license": license_id,
+                        "downloads": row.get("downloads"),
+                    },
+                )
+            )
+        if page_dates and min(page_dates) < cutoff:
+            break
+        url = parse_link_next(header_value(headers, "Link"))
+    return out
+
+
+def collect_modelsdev(
+    cutoff: datetime,
+    *,
+    http_get_json: Callable[..., tuple[Any, Any]] = http_get_json,
+) -> list[dict[str, Any]]:
+    payload, _ = http_get_json("https://models.dev/models.json")
+    out = []
+    for row in parse_modelsdev(payload):
+        if row["date"] and row["date"] >= cutoff:
+            out.append(
+                make_candidate(
+                    "models.dev",
+                    row["vendor"],
+                    row["title"],
+                    row["url"],
+                    row["date"],
+                    row["model_id"],
+                    85,
+                    kind="open_weights" if row.get("open_weights") else "release",
+                )
+            )
+    return out
+
+
+def collect_openrouter(cutoff: datetime) -> list[dict[str, Any]]:
+    url = "https://openrouter.ai/api/v1/models?" + urllib.parse.urlencode({"sort": "newest", "output_modalities": "all"})
+    payload, _ = http_get_json(url)
+    out = []
+    for row in parse_openrouter(payload):
+        if row["date"] and row["date"] >= cutoff:
+            out.append(
+                make_candidate(
+                    "openrouter",
+                    row["vendor"],
+                    row["title"],
+                    row["url"],
+                    row["date"],
+                    row["model_id"],
+                    65,
+                    kind="availability",
+                )
+            )
+    return out
+
+
+def collect_hn(cutoff: datetime) -> list[dict[str, Any]]:
+    out = []
+    seen = set()
+    cutoff_epoch = int(cutoff.timestamp())
+    for query in HN_QUERIES:
+        params = urllib.parse.urlencode(
+            {
+                "query": query,
+                "tags": "story",
+                "hitsPerPage": 8,
+                "numericFilters": f"created_at_i>{cutoff_epoch},points>30",
+            }
+        )
+        try:
+            payload, _ = http_get_json("https://hn.algolia.com/api/v1/search_by_date?" + params, retries=1)
+        except Exception as exc:  # secondary source: continue per query
+            log(f"HN query failed ({query}): {exc}")
+            continue
+        for row in payload.get("hits", []) if isinstance(payload, dict) else []:
+            if not isinstance(row, dict):
+                continue
+            object_id = str(row.get("objectID") or "")
+            title = clean_text(str(row.get("title") or ""))
+            if not object_id or object_id in seen or not looks_like_release(title):
+                continue
+            seen.add(object_id)
+            vendor = detect_vendor(title)
+            if vendor is None:
+                continue
+            out.append(
+                make_candidate(
+                    "hn",
+                    vendor,
+                    title,
+                    row.get("url") or f"https://news.ycombinator.com/item?id={object_id}",
+                    parse_datetime(row.get("created_at")),
+                    None,
+                    25,
+                    metadata={"points": row.get("points", 0), "comments": row.get("num_comments", 0)},
+                )
+            )
+    return out
+
+
+def collect_all(cutoff: datetime) -> tuple[list[dict[str, Any]], list[str]]:
+    jobs: list[tuple[str, Callable[[], list[dict[str, Any]]]]] = []
+    for source in OFFICIAL_FEEDS:
+        jobs.append((source["id"], lambda source=source: collect_official_feed(source, cutoff)))
+    jobs.append(("anthropic", lambda: collect_anthropic(cutoff)))
+    jobs.append(("deepseek", lambda: collect_deepseek(cutoff)))
+    jobs.append(("models.dev", lambda: collect_modelsdev(cutoff)))
+    jobs.append(("openrouter", lambda: collect_openrouter(cutoff)))
+    jobs.append(("hacker-news", lambda: collect_hn(cutoff)))
+    for org in HF_ORGS:
+        jobs.append((f"hf:{org}", lambda org=org: collect_hf_org(org, cutoff)))
+
+    candidates: list[dict[str, Any]] = []
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(12, len(jobs))) as executor:
+        futures = {executor.submit(fn): name for name, fn in jobs}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                rows = future.result()
+                candidates.extend(rows)
+                log(f"{name}: {len(rows)} candidate(s)")
+            except Exception as exc:
+                message = f"{name}: {type(exc).__name__}: {exc}"
+                errors.append(message)
+                log(f"SOURCE ERROR — {message}")
+    return filter_window(candidates, cutoff), errors
+
+
+def new_state() -> dict[str, Any]:
+    return {"version": 3, "pending": {}, "delivered": {}, "meta": {}}
+
+
+def load_state(path: os.PathLike[str] | str = DEFAULT_STATE_PATH) -> dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return new_state()
+    if not isinstance(state, dict) or state.get("version") != 3:
+        return new_state()
+    if not isinstance(state.get("pending"), dict) or not isinstance(state.get("delivered"), dict):
+        return new_state()
+    if not isinstance(state.get("meta"), dict):
+        state["meta"] = {}
+    return state
+
+
+def save_state(path: os.PathLike[str] | str, state: dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    with open(temp, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(state, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+def touch_heartbeat(
+    state: dict[str, Any], *, now: datetime | None = None, interval_days: int = 30
+) -> bool:
+    """Touch durable state infrequently so public-repo schedules stay active.
+
+    GitHub disables scheduled workflows in public repositories after 60 days with
+    no repository activity. A monthly state-only commit stays comfortably inside
+    that window without creating per-poll commit noise.
+    """
+    now = now or datetime.now(UTC)
+    meta = state.setdefault("meta", {})
+    previous = parse_datetime(meta.get("last_heartbeat_at"))
+    if previous and now - previous < timedelta(days=interval_days):
+        return False
+    meta["last_heartbeat_at"] = now.isoformat()
+    return True
+
+
+def prune_delivered(state: dict[str, Any], *, now: datetime | None = None, days: int = STATE_RETENTION_DAYS) -> None:
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(days=days)
+    kept = {}
+    for key, record in state.get("delivered", {}).items():
+        dt = parse_datetime(record.get("at") if isinstance(record, dict) else None)
+        if dt and dt >= cutoff:
+            kept[key] = record
+    state["delivered"] = kept
+
+
+def enqueue_events(state: dict[str, Any], events: list[dict[str, Any]]) -> int:
+    added = 0
+    for event in events:
+        key = event["key"]
+        if not should_publish(event):
+            continue
+        if key in state["delivered"] or key in state["pending"]:
+            continue
+        state["pending"][key] = {
+            "event": event,
+            "attempts": 0,
+            "last_error": None,
+            "queued_at": datetime.now(UTC).isoformat(),
+        }
+        added += 1
+    return added
+
+
+def format_date(value: Any) -> str:
+    dt = parse_datetime(value)
+    return dt.strftime("%Y-%m-%d · %H:%M UTC") if dt else "unknown"
+
+
+def discord_payload(event: dict[str, Any], *, username: str = "Signal2 · AI Release Intelligence") -> dict[str, Any]:
+    evidence = sorted(event.get("evidence", []), key=lambda x: x.get("trust", 0), reverse=True)
+    evidence_lines = []
+    for row in evidence[:6]:
+        label = SOURCE_LABELS.get(row.get("source"), row.get("source", "source"))
+        url = str(row.get("url") or "")
+        evidence_lines.append(f"[{label}]({url})")
+    if len(evidence) > 6:
+        evidence_lines.append(f"+{len(evidence) - 6} additional source(s)")
+
+    kind_label = {
+        "release": "MODEL RELEASE",
+        "open_weights": "OPEN WEIGHTS",
+        "availability": "MODEL AVAILABILITY",
+    }.get(event.get("kind"), "MODEL RELEASE")
+    confidence_label = {
+        "official": "Official",
+        "confirmed": "Confirmed",
+        "corroborated": "Corroborated",
+        "discovery": "Discovery",
+    }.get(event.get("confidence"), "Confirmed")
+    title = clean_text(str(event.get("title") or event.get("model_id") or "AI model release"))[:256]
+    model_id = clean_text(str(event.get("model_id") or "—"))
     embed = {
-        "title": "Signal2 — Système de veille IA opérationnel",
-        "description":
-            "Veille autonome dédiée aux **sorties de modèles d'intelligence "
-            "artificielle**, publiée en continu sur ce salon.\n\n"
-            "Analyse automatique de **42 sources** réparties en quatre couches "
-            "redondantes, sans dépendance à aucun poste local — infrastructure "
-            "cloud GitHub Actions.",
-        "color": 0x5865F2,
+        "title": title,
+        "url": event.get("url"),
+        "description": f"**{kind_label}** · {confidence_label}",
+        "color": SOURCE_COLORS.get(display_vendor(event.get("vendor")), 0x5865F2),
         "fields": [
-            {"name": "Couverture", "value":
-             "Anthropic · OpenAI · Google DeepMind · Meta · DeepSeek · "
-             "Qwen/Alibaba · Z.ai (GLM) · Moonshot/Kimi · Mistral · "
-             "Black Forest Labs · NVIDIA · Microsoft — et tout acteur émergent",
-             "inline": False},
-            {"name": "Méthode", "value":
-             "Couches 1–4 : annonces officielles (newsrooms) · poids ouverts "
-             "(Hugging Face, 12 organisations) · releases GitHub (10 "
-             "organisations) · résonance communautaire (Hacker News)",
-             "inline": False},
-            {"name": "Cadence", "value": "Analyse toutes les 15 minutes — 24/7", "inline": True},
-            {"name": "Rattrapage", "value": "Fenêtre 7 jours — aucune perte en cas d'interruption", "inline": True},
+            {"name": "Vendor", "value": display_vendor(event.get("vendor"))[:1024], "inline": True},
+            {"name": "Model", "value": f"`{model_id[:1000]}`", "inline": True},
+            {"name": "Published", "value": format_date(event.get("date")), "inline": True},
+            {"name": "Evidence", "value": " · ".join(evidence_lines)[:1024] or "—", "inline": False},
         ],
-        "author": {"name": "MASSRACE — Veille modèles IA",
-                   "icon_url": "https://avatars.githubusercontent.com/FeelTheFonk?size=64"},
-        "footer": {"text": "Signal2 — Veille IA · MASSRACE"},
-        "timestamp": datetime.now(UTC).isoformat(),
+        "footer": {"text": "Signal2 · autonomous AI model release intelligence"},
+        "timestamp": (parse_datetime(event.get("date")) or datetime.now(UTC)).isoformat(),
     }
-    ok = http_post_json(cfg["webhook_url"],
-                        {"username": cfg["webhook_name"], "embeds": [embed]})
-    log(f"Message de lancement {'envoyé' if ok else 'EN ÉCHEC'}")
-    return ok
+    return {
+        "username": username,
+        "allowed_mentions": {"parse": []},
+        "embeds": [embed],
+    }
 
-# ---------------------------------------------------------------------------
-# Point d'entrée
-# ---------------------------------------------------------------------------
 
-def main():
+class DiscordSender:
+    def __init__(self, webhook_url: str, *, username: str = "Signal2 · AI Release Intelligence") -> None:
+        webhook_url = webhook_url.strip()
+        if not webhook_url.startswith("https://"):
+            raise ValueError("Discord webhook must be an https:// URL")
+        parts = urllib.parse.urlsplit(webhook_url)
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        query = [(k, v) for k, v in query if k != "wait"] + [("wait", "true")]
+        self.url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), parts.fragment))
+        self.username = username
+
+    def send(self, event: dict[str, Any]) -> tuple[bool, str | None, str | None]:
+        payload = discord_payload(event, username=self.username)
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        for attempt in range(5):
+            request = urllib.request.Request(
+                self.url,
+                data=data,
+                method="POST",
+                headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    body = response.read()
+                    if 200 <= response.status < 300:
+                        message_id = None
+                        if body:
+                            try:
+                                obj = json.loads(body.decode("utf-8"))
+                                message_id = str(obj.get("id")) if isinstance(obj, dict) and obj.get("id") else None
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                pass
+                        return True, message_id, None
+                    return False, None, f"HTTP {response.status}"
+            except urllib.error.HTTPError as exc:
+                raw = exc.read()
+                if exc.code == 429 and attempt < 4:
+                    wait = None
+                    try:
+                        payload_429 = json.loads(raw.decode("utf-8"))
+                        wait = float(payload_429.get("retry_after"))
+                    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+                    if wait is None:
+                        try:
+                            wait = float(exc.headers.get("Retry-After", "2"))
+                        except ValueError:
+                            wait = 2.0
+                    time.sleep(min(max(wait, 0.2), 60.0))
+                    continue
+                if 500 <= exc.code < 600 and attempt < 4:
+                    time.sleep(min(2 ** attempt, 10))
+                    continue
+                detail = clean_text(raw.decode("utf-8", errors="replace"))[:300]
+                return False, None, f"HTTP {exc.code}: {detail}"
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt < 4:
+                    time.sleep(min(2 ** attempt, 10))
+                    continue
+                return False, None, f"{type(exc).__name__}: {exc}"
+        return False, None, "delivery retries exhausted"
+
+
+def deliver_outbox(
+    state: dict[str, Any],
+    sender: Any,
+    *,
+    limit: int | None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> dict[str, int]:
+    records = list(state.get("pending", {}).items())
+    records.sort(
+        key=lambda kv: parse_datetime(kv[1].get("event", {}).get("date")) or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    if limit is not None:
+        records = records[: max(0, limit)]
+    delivered = failed = 0
+    for key, record in records:
+        event = record["event"]
+        ok, message_id, error = sender.send(event)
+        if ok:
+            state["delivered"][key] = {
+                "at": datetime.now(UTC).isoformat(),
+                "message_id": message_id,
+                "title": event.get("title"),
+            }
+            state["pending"].pop(key, None)
+            delivered += 1
+            sleep_fn(0.35)
+        else:
+            record["attempts"] = int(record.get("attempts", 0)) + 1
+            record["last_error"] = error or "unknown delivery failure"
+            record["last_attempt_at"] = datetime.now(UTC).isoformat()
+            failed += 1
+    return {"delivered": delivered, "failed": failed, "remaining": len(state.get("pending", {}))}
+
+
+def run_status(*, delivery_failures: int, source_errors: list[str]) -> int:
+    """Return a non-zero process status for any operational degradation."""
+    return 1 if delivery_failures or source_errors else 0
+
+
+def print_report(events: list[dict[str, Any]], errors: list[str], cutoff: datetime) -> None:
+    print(f"\nSignal2 dry-run · since {cutoff.isoformat()} · {len(events)} publishable event(s)")
+    for event in events:
+        sources = ", ".join(sorted({SOURCE_LABELS.get(x["source"], x["source"]) for x in event["evidence"]}))
+        print(f"- {format_date(event['date'])} | {display_vendor(event['vendor'])} | {event['title']} | {event['confidence']} | {sources}")
+        print(f"  {event['url']}")
+    if errors:
+        print(f"\n{len(errors)} source error(s):")
+        for error in errors:
+            print(f"- {error}")
+
+
+def execute(mode: str, *, days: int, publish: bool, state_path: Path) -> int:
+    now = datetime.now(UTC)
+    cutoff = now - (timedelta(days=days) if mode == "digest" else timedelta(hours=POLL_LOOKBACK_HOURS))
+    candidates, errors = collect_all(cutoff)
+    events = [event for event in merge_candidates(candidates) if should_publish(event)]
+
+    if not publish:
+        print_report(events, errors, cutoff)
+        return 0
+
+    webhook = os.environ.get("SIGNAL2_WEBHOOK", "").strip()
+    if not webhook:
+        log("FATAL — SIGNAL2_WEBHOOK is required with --publish")
+        return 2
+
+    state = load_state(state_path)
+    prune_delivered(state, now=now)
+    touch_heartbeat(state, now=now)
+    added = enqueue_events(state, events)
+    # Persist the outbox before delivery at process level. The GitHub workflow then
+    # commits the final state even if delivery fails.
+    save_state(state_path, state)
+    log(f"outbox: {added} new, {len(state['pending'])} pending")
+
+    sender = DiscordSender(webhook)
+    limit = None if mode == "digest" else POLL_DELIVERY_LIMIT
+    result = deliver_outbox(state, sender, limit=limit)
+    save_state(state_path, state)
+    log(
+        f"delivery: {result['delivered']} confirmed, {result['failed']} failed, "
+        f"{result['remaining']} pending · {len(errors)} source error(s)"
+    )
+    # State is persisted before returning non-zero so the next scheduled cycle can
+    # reconcile automatically while Actions makes the degradation immediately visible.
+    return run_status(delivery_failures=result["failed"], source_errors=errors)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Signal2 — autonomous AI model release intelligence")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--poll", action="store_true", help=f"scan the last {POLL_LOOKBACK_HOURS} hours")
+    mode.add_argument("--digest", nargs="?", type=int, const=7, metavar="DAYS", help="scan a retrospective window (default: 7 days)")
+    parser.add_argument("--publish", action="store_true", help="publish through SIGNAL2_WEBHOOK and update durable state")
+    parser.add_argument("--state", default=str(DEFAULT_STATE_PATH), help="state file path")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
-
-    ap = argparse.ArgumentParser(description="Signal2 — veille IA MASSRACE")
-    ap.add_argument("--poll", action="store_true", help="un cycle de veille")
-    ap.add_argument("--loop", nargs="?", type=int, const=15, metavar="MIN",
-                    help="cycles répétés (minutes, défaut 15)")
-    ap.add_argument("--test", action="store_true", help="cycle à blanc")
-    ap.add_argument("--digest", nargs="?", type=int, const=7, metavar="JOURS",
-                    help="digest rétrospectif")
-    ap.add_argument("--launch-msg", action="store_true", help="message de lancement")
-    args = ap.parse_args()
-
-    cfg = dict(DEFAULT_CONFIG)
-    file_cfg = load_json(CONFIG_PATH, {})
-    if isinstance(file_cfg, dict):
-        cfg.update(file_cfg)
-    # Le secret (webhook Discord) prime toujours sur tout le reste :
-    # env SIGNAL2_WEBHOOK (GitHub Actions secret / local).
-    env_wh = os.environ.get("SIGNAL2_WEBHOOK", "").strip()
-    if env_wh:
-        cfg["webhook_url"] = env_wh
-
-    if not cfg.get("webhook_url"):
-        log("ERREUR: webhook_url manquant (SIGNAL2_WEBHOOK ou config)")
-        sys.exit(1)
-
-    if args.launch_msg:
-        send_launch_message(cfg)
+    args = build_parser().parse_args(argv)
     if args.digest is not None:
-        run_digest(cfg, args.digest)
-    if args.test:
-        run_cycle(cfg, dry_run=True)
-    elif args.poll:
-        run_cycle(cfg)
-    elif args.loop is not None:
-        interval = max(5, args.loop) * 60
-        log(f"Boucle continue démarrée (intervalle {args.loop} min)")
-        while True:
-            try:
-                run_cycle(cfg)
-            except Exception as e:  # noqa: BLE001
-                log(f"Erreur cycle (boucle): {e}")
-            time.sleep(interval)
-    if not any([args.launch_msg, args.digest is not None, args.test, args.poll,
-                args.loop is not None]):
-        ap.print_help()
+        if args.digest < 1 or args.digest > 30:
+            raise SystemExit("--digest DAYS must be between 1 and 30")
+        return execute("digest", days=args.digest, publish=args.publish, state_path=Path(args.state))
+    return execute("poll", days=0, publish=args.publish, state_path=Path(args.state))
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
