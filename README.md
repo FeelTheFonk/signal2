@@ -1,54 +1,57 @@
-# 🛰️ Signal2 — Veille IA autonome 24/7 (MASSRACE)
+# Signal2
 
-Veille active sur **toutes les sorties de modèles d'IA** (Anthropic, OpenAI,
-Google DeepMind, Meta, DeepSeek, Qwen/Alibaba, Z.ai/Zhipu, Moonshot/Kimi,
-Mistral, xAI, Black Forest Labs, NVIDIA, Microsoft + tout nouvel acteur majeur),
-publiée automatiquement sur le salon **#llm** du serveur Discord **MASSRACE**.
+![cycle](https://github.com/FeelTheFonk/signal2/actions/workflows/veille.yml/badge.svg)
 
-## ⚙️ Infrastructure — 100 % gratuite et indépendante de tout PC
+Autonomous 24/7 watch for **AI model releases**. Runs entirely on GitHub
+Actions — every 15 minutes, forever, for free — and publishes clean,
+structured alerts to a Discord channel.
 
-- **Hébergement** : GitHub Actions (repo public → minutes **illimitées**)
-- **Cadence** : cron toutes les **15 minutes**, 24/7, sans interruption
-- **Anti-doublon inter-exécutions** : l'état (`signal2_state.json`) est
-  re-committé à la fin de chaque cycle (d'où les commits "state:")
-- **Secrets** : le webhook Discord vit dans le secret `SIGNAL2_WEBHOOK`
-  (jamais dans le code) ; `GITHUB_TOKEN` est fourni automatiquement par Actions
-- **Coût** : 0 € — aucune API payante, aucune clé, aucun serveur
+**Zero dependencies. Zero API keys. Zero cost.**
 
-## 🔎 Les 4 couches de détection (aucune omission)
+## Detection — four redundant layers
 
-| Couche | Sources | Type de signal |
+| Layer | Sources | Signal |
 |---|---|---|
-| 1. Officielle | RSS OpenAI, Mistral, Qwen, Google DeepMind + pages news Anthropic, xAI, DeepSeek | 🚀 sorties / 📰 annonces |
-| 2. Hugging Face | 12 organisations suivies (nouveaux modèles publics) | 📦 poids ouverts |
-| 3. GitHub | Évènements release de 10 organisations | 🏷️ releases |
-| 4. Hacker News | Requêtes Algolia multi-mots-clés, score ≥ 40 | 📡 buzz fort (filet de sécurité) |
+| Official | OpenAI, Mistral, Qwen, Google DeepMind newsfeeds + Anthropic, xAI, DeepSeek newsrooms | model releases & vendor announcements |
+| Open weights | Hugging Face — 12 organizations (DeepSeek, Qwen, Z.ai, Moonshot, Meta, Mistral, OpenAI, xAI, BFL, Google, NVIDIA, Microsoft) | new public checkpoints |
+| Code | GitHub release events — 10 organizations | tags & releases |
+| Community | Hacker News (Algolia API), score-gated | strong resonance — safety net for anything the above misses |
 
-Fenêtre d'annonce : 7 jours — si le service subissait une interruption, il
-**rattrape tout** au redémarrage (rien n'est perdu, rien n'est reposté).
+## Nothing is ever missed, nothing is ever duplicated
 
-## 🧪 Utilisation locale (développement uniquement)
+- Every item is fingerprinted; state is committed back to the repo after each
+  cycle, so consecutive runs never re-post.
+- A 7-day catch-up window means that even after an outage, everything that
+  happened in the meantime is recovered on the next cycle — silently skipping
+  anything already reported.
+- Rate-limit-proof: ETag-cached GitHub calls, conditional requests, per-domain
+  backoff, per-cycle fetch budgets.
+
+## Design
+
+- Single file, Python stdlib only — no supply chain, nothing to install.
+- Multi-vendor dedup (identical news submitted several times collapses to the
+  highest-signal item).
+- Relevance filter tuned to model releases: product names × release verbs,
+  open-weights phrasing — vendor marketing noise is dropped.
+- Publication format: one embed per item, vendor-colored, consistent fields,
+  releases always reported first.
+
+## Local usage (development only)
 
 ```bash
-python signal2.py --test        # cycle à blanc, aucun envoi
-python signal2.py --poll        # un cycle réel
-python signal2.py --digest 7    # digest rétrospectif
-python signal2.py --launch-msg  # message de présentation
+python signal2.py --test        # dry run, nothing sent
+python signal2.py --poll        # one live cycle
+python signal2.py --digest 7    # retrospective digest
+python signal2.py --launch-msg  # presentation message
 ```
 
-⚠️ Ne pas laisser tourner `--loop` en local en parallèle d'Actions :
-l'état divergerait et provoquerait des doublons. Le repo est la source de vérité.
+Do not run `--loop` locally while Actions is active: state would diverge and
+cause duplicates. The repository is the single source of truth.
 
-## 📁 Fichiers
+## Files
 
-- `signal2.py` — le système complet (stdlib uniquement, zéro dépendance)
-- `signal2_config.json` — config locale (gitignored, contient le webhook)
-- `signal2_state.json` — état persistant (suivi anti-doublon)
-- `signal2.log` — journal (gitignored)
-
-## 🛠️ Maintenance
-
-- Ajouter un éditeur : listes `official_sources`, `hf_orgs`, `github_orgs`,
-  `hn_queries` dans `signal2.py` (DEFAULT_CONFIG)
-- Historique des veilles : onglet **Actions** du repo
-- Vérifier un cycle : `gh run list --limit 5` puis `gh run view <id> --log`
+- `signal2.py` — the entire system
+- `signal2_state.json` — dedup state, committed by each run
+- `signal2_config.json` — local config (gitignored; webhook lives in the
+  `SIGNAL2_WEBHOOK` repository secret)

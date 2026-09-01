@@ -163,11 +163,15 @@ VENDOR_STYLE = {
     "Black Forest Labs": 0x5865F2, "NVIDIA":           0x76B900,
     "Microsoft":         0x00A4EF, "_default":         0x5865F2,
 }
-VENDOR_EMOJI = {
-    "Anthropic": "🟠", "OpenAI": "🟢", "Google DeepMind": "🔵", "DeepSeek": "🔷",
-    "Qwen (Alibaba)": "🟠", "Meta AI": "🔵", "Z.ai (Zhipu)": "🌐",
-    "Moonshot AI": "🟣", "Mistral AI": "🟠", "xAI": "⚪",
-    "Black Forest Labs": "🎨", "NVIDIA": "💚", "Microsoft": "🔹",
+# Logos éditeurs (avatars d'organisations GitHub — URLs publiques stables)
+GITHUB_AVATAR = {
+    "Anthropic": "anthropics", "OpenAI": "openai",
+    "Google DeepMind": "google-deepmind", "DeepSeek": "deepseek-ai",
+    "Qwen (Alibaba)": "QwenLM", "Meta AI": "meta-llama",
+    "Z.ai (Zhipu)": "zai-org", "Moonshot AI": "moonshotai",
+    "Mistral AI": "mistralai", "xAI": "xai-org",
+    "Black Forest Labs": "black-forest-labs", "NVIDIA": "nvidia",
+    "Microsoft": "microsoft",
 }
 
 MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
@@ -291,8 +295,27 @@ def fmt_date(dt):
         return "—"
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
-    return (f"{dt.day} {MOIS_FR[dt.month - 1]} {dt.year} "
-            f"à {dt.strftime('%H:%M')} UTC")
+    day = f"{dt.day}er" if dt.day == 1 else str(dt.day)
+    return f"{day} {MOIS_FR[dt.month - 1]} {dt.year} · {dt.strftime('%H:%M')} UTC"
+
+
+TITLE_KEEP_UPPER = {"gpt", "glm", "ai", "llm", "api", "aws", "xp", "cli",
+                    "tts", "stt", "r&d", "xai", "vlm", "agi", "ecg", "ehr"}
+
+
+def pretty_title(s):
+    """Met en forme un titre issu d'un slug (minuscules) : casse propre,
+    acronymes préservés, versions et identifiants inchangés."""
+    out = []
+    for w in s.split():
+        lw = w.lower()
+        if lw in TITLE_KEEP_UPPER:
+            out.append(w.upper())
+        elif any(c.isdigit() for c in w):
+            out.append(w)
+        else:
+            out.append(w[:1].upper() + w[1:] if w else w)
+    return " ".join(out)
 
 
 def parse_http_date(s):
@@ -501,71 +524,97 @@ def fetch_hn(cfg, hours_window, min_points):
 def normalize_official(source, raw):
     vendor = detect_vendor(raw["title"]) or source["vendor"]
     is_model = passes_filter(raw["title"], "strong")
+    title = htmllib.unescape(raw["title"])
+    if raw.get("slug"):  # titre issu d'un slug -> mise en forme propre
+        title = pretty_title(title)
     return {
         "key": item_key("official", raw["id"]),
         "source": "official",
         "source_id": source["id"],
         "vendor": vendor,
         "type": "release" if is_model else "news",
-        "title": htmllib.unescape(raw["title"]),
+        "title": title,
         "url": raw["url"],
         "date": raw["date"],
     }
 
 
 def build_embed(it):
+    """Embed sobre et expert : pas d'emoji, logo éditeur discret, champs
+    alignés, libellés homogènes."""
     vendor = it.get("vendor") or detect_vendor(it["title"]) or "Indéterminé"
     color = VENDOR_STYLE.get(vendor, VENDOR_STYLE["_default"])
-    emoji = VENDOR_EMOJI.get(vendor, "✨")
     src = it["source"]
+    avatar = GITHUB_AVATAR.get(vendor)
 
     if src == "official":
-        if it["type"] == "release":
-            desc = "🚀 **Sortie / annonce officielle** (modèle ou capacité majeure)"
-        else:
-            desc = "📰 Annonce officielle éditeur"
-        fields = [{"name": "Éditeur", "value": f"{emoji} {vendor}", "inline": True},
-                  {"name": "Date", "value": fmt_date(it.get("date")), "inline": True},
-                  {"name": "Source", "value": it["source_id"], "inline": True}]
-        title, url = it["title"], it["url"]
+        category = ("SORTIE / ANNONCE" if it["type"] == "release"
+                    else "COMMUNICATION ÉDITEUR")
+        desc = ("Version ou sortie de modèle confirmée — canal officiel de "
+                "l'éditeur." if it["type"] == "release"
+                else "Communication officielle de l'éditeur.")
+        fields = [
+            {"name": "Catégorie", "value": category, "inline": True},
+            {"name": "Publié", "value": fmt_date(it.get("date")), "inline": True},
+            {"name": "Canal", "value": source_label(it.get("source_id", "")), "inline": True},
+        ]
 
     elif src == "hf":
-        desc = "📦 **Poids ouverts publiés** sur Hugging Face"
-        fields = [{"name": "Éditeur", "value": f"{emoji} {vendor}", "inline": True},
-                  {"name": "Date", "value": fmt_date(it.get("date")), "inline": True},
-                  {"name": "Type", "value": it.get("pipeline", "model"), "inline": True},
-                  {"name": "Téléchargements (30j)",
-                   "value": f"{it.get('downloads', 0):,}".replace(",", " "),
-                   "inline": True}]
+        desc = "Poids ouverts publiés sur Hugging Face."
+        fields = [
+            {"name": "Catégorie", "value": "POIDS OUVERTS", "inline": True},
+            {"name": "Publié", "value": fmt_date(it.get("date")), "inline": True},
+            {"name": "Type", "value": (it.get("pipeline") or "model").replace("-", " "), "inline": True},
+            {"name": "Téléchargements (30 j)",
+             "value": f"{it.get('downloads', 0):,}".replace(",", " "), "inline": True},
+        ]
         if it.get("license"):
             fields.append({"name": "Licence", "value": it["license"], "inline": True})
-        title, url = it["title"], it["url"]
 
     elif src == "github":
-        desc = "🏷️ **Release GitHub** publiée"
-        fields = [{"name": "Éditeur", "value": f"{emoji} {vendor}", "inline": True},
-                  {"name": "Date", "value": fmt_date(it.get("date")), "inline": True},
-                  {"name": "Repo", "value": f"`{it.get('repo','')}`", "inline": True}]
-        title, url = it["title"], it["url"]
+        desc = "Release publiée sur GitHub."
+        fields = [
+            {"name": "Catégorie", "value": "RELEASE", "inline": True},
+            {"name": "Publié", "value": fmt_date(it.get("date")), "inline": True},
+            {"name": "Dépôt", "value": f"`{it.get('repo', '')}`", "inline": True},
+        ]
 
     else:  # hn
-        desc = "📡 **Forte résonance communautaire** (Hacker News)"
-        fields = [{"name": "Éditeur probable", "value": f"{emoji} {vendor}", "inline": True},
-                  {"name": "Score", "value": f"⬆️ {it.get('points',0)} · 💬 {it.get('comments',0)}",
-                   "inline": True},
-                  {"name": "Date", "value": fmt_date(it.get("date")), "inline": True}]
-        title, url = it["title"], it["hn_url"]
+        desc = "Forte résonance communautaire — Hacker News."
+        fields = [
+            {"name": "Catégorie", "value": "VEILLE COMMUNAUTÉ", "inline": True},
+            {"name": "Score", "value": f"{it.get('points', 0)} points · "
+                                       f"{it.get('comments', 0)} commentaires",
+             "inline": True},
+            {"name": "Publié", "value": fmt_date(it.get("date")), "inline": True},
+        ]
 
-    return {
-        "title": title[:250],
-        "url": url,
+    embed = {
+        "title": it["title"][:250],
+        "url": it["url"] if src != "hn" else it["hn_url"],
         "description": desc,
         "color": color,
         "fields": fields,
-        "footer": {"text": "Signal2 · Veille modèles IA · MASSRACE"},
-        "timestamp": (it.get("date") or datetime.now(UTC)).isoformat()
-        if it.get("date") else datetime.now(UTC).isoformat(),
+        "footer": {"text": f"Signal2 — Veille IA · MASSRACE · {vendor}"},
+        "timestamp": (it.get("date") or datetime.now(UTC)).isoformat(),
     }
+    embed["author"] = {"name": vendor}
+    if avatar:
+        embed["author"]["icon_url"] = (f"https://avatars.githubusercontent.com/"
+                                       f"{avatar}?size=64")
+    return embed
+
+
+def source_label(source_id):
+    return {
+        "openai-rss": "Newsroom OpenAI",
+        "mistral-rss": "Newsroom Mistral",
+        "qwen-rss": "Blog Qwen",
+        "google-rss": "Blog DeepMind",
+        "anthropic": "Newsroom Anthropic",
+        "xai": "Newsroom xAI",
+        "deepseek": "Notes API DeepSeek",
+    }.get(source_id, source_id)
 
 
 def send_items(cfg, items, header=None):
@@ -713,7 +762,7 @@ def run_cycle(cfg, dry_run=False):
         others = [i for i in fresh if i.get("type") != "release"]
         if releases:
             send_items(cfg, releases,
-                       header="🚨 **Nouvelle(s) sortie(s) / annonce(s) IA détectée(s)**")
+                       header="**VEILLE IA — SORTIES & ANNONCES DÉTECTÉES**")
             sent += len(releases)
         if others:
             send_items(cfg, others)
@@ -794,10 +843,9 @@ def run_digest(cfg, days=7):
     if len(items) > 60:
         published = items[:60]
         truncated = len(items) - 60
-    header = (f"🧾 **Signal2 — Digest des {days} derniers jours** "
-              f"(rattrapage initial, {len(published)} éléments"
-              + (f", {truncated} mineurs capitalisés" if truncated else "")
-              + ")")
+    header = (f"**VEILLE IA — DIGEST {days} DERNIERS JOURS** · "
+              f"{len(published)} éléments"
+              + (f" ({truncated} mineurs capitalisés)" if truncated else ""))
     sent = send_items(cfg, published, header=header)
     now_iso = datetime.now(UTC).isoformat()
     for it in items:
@@ -808,26 +856,31 @@ def run_digest(cfg, days=7):
 
 def send_launch_message(cfg):
     embed = {
-        "title": "🛰️ Signal2 — Veille IA désormais en ligne",
+        "title": "Signal2 — Système de veille IA opérationnel",
         "description":
-            "Veille active et autonome sur **toutes les sorties de modèles d'IA**. "
-            "Vérification automatique toutes les **15 minutes**, 24h/24.\n\n"
-            "**Couverture éditeurs** : Anthropic · OpenAI · Google DeepMind · Meta · "
-            "DeepSeek · Qwen/Alibaba · Z.ai (GLM) · Moonshot/Kimi · Mistral · xAI · "
-            "Black Forest Labs · NVIDIA · Microsoft — et tout nouvel acteur majeur.\n\n"
-            "**4 couches de détection (aucune omission)** :\n"
-            "1️⃣ Annonces officielles (RSS & news éditeurs)\n"
-            "2️⃣ Publications de poids ouverts (Hugging Face)\n"
-            "3️⃣ Releases GitHub (10 organisations suivies)\n"
-            "4️⃣ Buzz communautaire fort (Hacker News) — filet de sécurité\n\n"
-            "**Légende** : 🚀 sortie majeure · 📦 poids ouverts · 🏷️ release GitHub · "
-            "📰 annonce · 📡 buzz",
+            "Veille autonome dédiée aux **sorties de modèles d'intelligence "
+            "artificielle**, publiée en continu sur ce salon.\n\n"
+            "Analyse automatique de **30 sources** réparties en quatre couches "
+            "redondantes, sans dépendance à aucun poste local — infrastructure "
+            "cloud GitHub Actions.",
         "color": 0x5865F2,
         "fields": [
-            {"name": "Priorité", "value": "Les sorties de modèles (🚀) sont toujours signalées en tête et en premier.", "inline": False},
-            {"name": "Statut", "value": "✅ Système opérationnel — publication autonome", "inline": False},
+            {"name": "Couverture", "value":
+             "Anthropic · OpenAI · Google DeepMind · Meta · DeepSeek · "
+             "Qwen/Alibaba · Z.ai (GLM) · Moonshot/Kimi · Mistral · xAI · "
+             "Black Forest Labs · NVIDIA · Microsoft — et tout acteur émergent",
+             "inline": False},
+            {"name": "Méthode", "value":
+             "Couches 1–4 : annonces officielles (newsrooms) · poids ouverts "
+             "(Hugging Face, 12 organisations) · releases GitHub (10 "
+             "organisations) · résonance communautaire (Hacker News)",
+             "inline": False},
+            {"name": "Cadence", "value": "Analyse toutes les 15 minutes — 24/7", "inline": True},
+            {"name": "Rattrapage", "value": "Fenêtre 7 jours — aucune perte en cas d'interruption", "inline": True},
         ],
-        "footer": {"text": "Signal2 · Veille modèles IA · MASSRACE"},
+        "author": {"name": "MASSRACE — Veille modèles IA",
+                   "icon_url": "https://avatars.githubusercontent.com/FeelTheFonk?size=64"},
+        "footer": {"text": "Signal2 — Veille IA · MASSRACE"},
         "timestamp": datetime.now(UTC).isoformat(),
     }
     ok = http_post_json(cfg["webhook_url"],

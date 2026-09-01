@@ -2,8 +2,8 @@ name: Signal2 - Veille IA
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # toutes les 15 minutes, 24/7, minutes illimitées (repo public)
-  workflow_dispatch:          # déclenchement manuel possible
+    - cron: "*/15 * * * *"   # every 15 minutes — unlimited minutes on public repos
+  workflow_dispatch:          # manual trigger
 
 permissions:
   contents: write             # autorise le commit de l'état (signal2_state.json)
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   veille:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     env:
       SIGNAL2_WEBHOOK: ${{ secrets.SIGNAL2_WEBHOOK }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 1000 req/h pour l'API GitHub
