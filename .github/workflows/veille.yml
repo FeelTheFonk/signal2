@@ -20,7 +20,7 @@ jobs:
       SIGNAL2_WEBHOOK: ${{ secrets.SIGNAL2_WEBHOOK }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 1000 req/h pour l'API GitHub
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Cycle de veille (poll + publication Discord)
         run: python3 signal2.py --poll
