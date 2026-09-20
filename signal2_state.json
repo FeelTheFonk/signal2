@@ -30,10 +30,20 @@
       "message_id": "1547365944496750664",
       "title": "Claude 2"
     },
+    "evt_4de9a33b05bfefb648c92ccce2d475cb": {
+      "at": "2026-09-20T13:42:43.269428+00:00",
+      "message_id": "1551227107982442657",
+      "title": "Qwen-Image-2.1-PE-I2I"
+    },
     "evt_507ae5ee2ead63731b492b92f8df74b4": {
       "at": "2026-09-09T21:59:49.352664+00:00",
       "message_id": "1547365938188525632",
       "title": "Releasing Claude Instant 1 2"
+    },
+    "evt_52f2637f4426cbb36a2a062ef63f4fcb": {
+      "at": "2026-09-20T13:42:44.065197+00:00",
+      "message_id": "1551227111573033061",
+      "title": "Qwen-Image-2.1-PE-T2I"
     },
     "evt_5c17f4f238368906dd53384067f39c2b": {
       "at": "2026-09-18T06:16:48.374622+00:00",
