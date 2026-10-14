@@ -165,6 +165,11 @@
       "message_id": "1544486376106623069",
       "title": "DeepSeek-V4-Flash-Vision-Exp"
     },
+    "evt_c673771e83bdaa3776f2b5b664cd8a88": {
+      "at": "2026-10-14T22:27:42.527930+00:00",
+      "message_id": "1560056534459875389",
+      "title": "Nemotron 3.5 Super VL 120B A12B"
+    },
     "evt_c89552a2593777bda79b82ce900f1f40": {
       "at": "2026-09-21T22:11:35.178400+00:00",
       "message_id": "1551717556522320053",
