@@ -65,6 +65,11 @@
       "message_id": "1544486371912060989",
       "title": "Claude Fable 5.1"
     },
+    "evt_3562da60246d4ea35e74530a12d8fb2b": {
+      "at": "2026-10-15T18:29:05.669818+00:00",
+      "message_id": "1560358873796190250",
+      "title": "Timestral-5M"
+    },
     "evt_3ad859e98cf3d4cdb203537eae4bd816": {
       "at": "2026-09-23T19:54:56.911030+00:00",
       "message_id": "1552407946355548365",
@@ -110,10 +115,25 @@
       "message_id": "1551227111573033061",
       "title": "Qwen-Image-2.1-PE-T2I"
     },
+    "evt_57ba3cbcbd55a81fd7441cc355b4410b": {
+      "at": "2026-10-15T18:29:04.388973+00:00",
+      "message_id": "1560358867932811368",
+      "title": "Timestral-123M"
+    },
     "evt_5c17f4f238368906dd53384067f39c2b": {
       "at": "2026-09-18T06:16:48.374622+00:00",
       "message_id": "1550390114944028774",
       "title": "Qwen3.8 Omni Flash"
+    },
+    "evt_5d327fa1e0fc18205210fba1dbdd1dbf": {
+      "at": "2026-10-15T18:29:03.797635+00:00",
+      "message_id": "1560358865911025816",
+      "title": "flux-3-image-klein-pup"
+    },
+    "evt_630ab28ac4678a23e43857377d76e3bd": {
+      "at": "2026-10-15T18:29:06.615370+00:00",
+      "message_id": "1560358877101297825",
+      "title": "flux-3-image-klein-comfy"
     },
     "evt_63a13076fbea89f5eec9f8725c0515c8": {
       "at": "2026-09-21T22:11:35.662771+00:00",
@@ -155,6 +175,16 @@
       "message_id": "1557040853380370514",
       "title": "Introducing Mistral Large 4"
     },
+    "evt_8f56dcfb95c1f9d2fc94fad5f6a445a2": {
+      "at": "2026-10-15T18:29:05.093701+00:00",
+      "message_id": "1560358870994386955",
+      "title": "Timestral-28M"
+    },
+    "evt_a84a8d51bff3d191d618b8691e5c9eae": {
+      "at": "2026-10-15T18:29:03.190459+00:00",
+      "message_id": "1560358861838221323",
+      "title": "Nemotron-3.5-Rerank-8B-BF16"
+    },
     "evt_b149b651e3e56dda6e83ce8eb595d6b2": {
       "at": "2026-09-28T05:35:57.783983+00:00",
       "message_id": "1554003713989943347",
@@ -164,6 +194,11 @@
       "at": "2026-09-01T23:17:27.326682+00:00",
       "message_id": "1544486376106623069",
       "title": "DeepSeek-V4-Flash-Vision-Exp"
+    },
+    "evt_c314fe8c39b985c51deebc3a1f529cc0": {
+      "at": "2026-10-15T18:29:07.205567+00:00",
+      "message_id": "1560358880201019505",
+      "title": "Timestral-209M"
     },
     "evt_c673771e83bdaa3776f2b5b664cd8a88": {
       "at": "2026-10-14T22:27:42.527930+00:00",
